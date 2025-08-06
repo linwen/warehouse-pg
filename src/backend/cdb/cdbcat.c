@@ -421,7 +421,7 @@ GpPolicyFetch(Oid tbloid)
 		int			i;
 		int			nattrs;
 		int2vector *distkey;
-		oidvector  *distopclasses;
+		oidvector  *distopclasses = NULL;
 
 		/*
 		 * Sanity check of numsegments.

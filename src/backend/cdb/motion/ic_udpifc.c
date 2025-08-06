@@ -4586,7 +4586,7 @@ sendtoWithRetry(int socket, const void *message, size_t length,
            int flags, const struct sockaddr *dest_addr,
            socklen_t dest_len, int retry, const char *errDetail)
 {
-	int32		n;
+	int32		n = 0;
 	int count = 0;
 
 xmit_retry:

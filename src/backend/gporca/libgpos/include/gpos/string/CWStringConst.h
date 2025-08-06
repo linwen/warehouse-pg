@@ -29,6 +29,7 @@ namespace gpos
 //---------------------------------------------------------------------------
 class CWStringConst : public CWStringBase
 {
+	using CWStringBase::Equals;
 private:
 	// null terminated wide character buffer
 	const WCHAR *m_w_str_buffer;
