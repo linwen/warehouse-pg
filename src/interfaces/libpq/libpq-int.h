@@ -251,9 +251,16 @@ struct pg_result
 	int64		numRejected;
 	/* GPDB: number of rows completed when COPY FROM */
 	int64		numCompleted;
-	/* GPDB */
-	int		nWaits;
-	int		*waitGxids;
+	/*
+	 * GPDB: waitGxid for ordering transactions on QD
+	 *
+	 * After enabling the global deadlock detector, we can support concurrent updates.
+	 * When updating one tuple at the same time, the conflict and wait are moved from
+	 * QD to QE. We need to make sure the implicated transaction order on the segments
+	 * is also considered on the master when taking the distributed snapshots.
+	 */
+	int			nWaits;
+	int64		*waitGxids;		/* Gxid is a DistributedTransactionId, it's 64bits integer */
 };
 
 /* PGAsyncStatusType defines the state of the query-execution state machine */
