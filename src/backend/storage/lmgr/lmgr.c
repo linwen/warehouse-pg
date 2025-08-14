@@ -692,7 +692,7 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 	{
 		MemoryContext oldContext;
 		DistributedTransactionId gxid = LocalXidGetDistributedXid(xid);
-		
+
 		if (gxid != InvalidDistributedTransactionId)
 		{
 			/*

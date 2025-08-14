@@ -1494,7 +1494,7 @@ resetTmGxact(void)
 	MyTmGxactLocal->isOnePhaseCommit = false;
 	if (MyTmGxactLocal->waitGxids != NULL)
 	{
-		list_free(MyTmGxactLocal->waitGxids);
+		list_free_deep(MyTmGxactLocal->waitGxids);
 		MyTmGxactLocal->waitGxids = NULL;
 	}
 	setCurrentDtxState(DTX_STATE_NONE);
@@ -2096,7 +2096,8 @@ sendWaitGxidsToQD(List *waitGxids)
 	pq_sendint(&buf, len, 4);
 	foreach(lc, waitGxids)
 	{
-		pq_sendint(&buf, lfirst_int(lc), 4);
+		DistributedTransactionId *gxid = (DistributedTransactionId *) lfirst(lc);
+		pq_sendint64(&buf, *gxid);
 	}
 	pq_endmessage(&buf);
 }
