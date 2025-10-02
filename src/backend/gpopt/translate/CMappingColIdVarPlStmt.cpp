@@ -29,6 +29,7 @@ extern "C" {
 #include "naucrates/dxl/operators/CDXLScalarIdent.h"
 #include "naucrates/exception.h"
 #include "naucrates/md/CMDIdGPDB.h"
+#include "gpopt/translate/CTranslatorUtils.h"
 
 using namespace gpdxl;
 using namespace gpos;
@@ -220,15 +221,43 @@ CMappingColIdVarPlStmt::VarFromDXLNodeScId(const CDXLScalarIdent *dxlop)
 		}
 	}
 
+	/* 记录第一次解析结果（不使用未定义变量）*/
+    elog(LOG,
+         "[WRV-PVAR] colid=%lu name=%s initial_attno=%d base_varno=%d",
+         colid,
+         CTranslatorUtils::CreateMultiByteCharStringFromWCString(
+             dxlop->GetDXLColRef()->MdName()->GetMDName()->GetBuffer()),
+         attno,
+         varno);
+
 	Var *var = gpdb::MakeVar(varno, attno,
 							 CMDIdGPDB::CastMdid(dxlop->MdidType())->Oid(),
 							 dxlop->TypeModifier(),
 							 0	// varlevelsup
 	);
 
+	    /* 防御：基表 / 无子节点仍 attno=0 -> 进行修复或 fail-fast */
+    if (attno == 0)
+    {
+        elog(DEBUG1,
+             "[WRV-PVAR] unresolved attno for colid=%lu name=%s (will attempt repair)",
+             colid,
+             CTranslatorUtils::CreateMultiByteCharStringFromWCString(
+                 dxlop->GetDXLColRef()->MdName()->GetMDName()->GetBuffer()));
+    }
+
 	// set varnoold and varoattno since makeVar does not set them properly
 	var->varnoold = varno_old;
 	var->varoattno = attno_old;
+
+	if (var->varattno == 0 && var->vartype != RECORDOID)
+    {
+        elog(DEBUG1,
+             "[WRV-PVAR-GUARD] coercing scalar attno=0 var (colid=%lu type=%u) to RECORDOID",
+             colid, var->vartype);
+        //var->vartype   = RECORDOID;
+        //var->varcollid = InvalidOid;
+    }
 
 	return var;
 }

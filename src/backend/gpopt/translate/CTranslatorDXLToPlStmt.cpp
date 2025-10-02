@@ -4219,6 +4219,21 @@ CTranslatorDXLToPlStmt::TranslateDXLSequence(
 
 	return (Plan *) psequence;
 }
+static void
+LogTList(const char *phase, List *tlist)
+{
+    ListCell *lc;
+    foreach(lc, tlist)
+    {
+        TargetEntry *tle = (TargetEntry*) lfirst(lc);
+        if (IsA(tle->expr, Var)) {
+            Var *v = (Var*) tle->expr;
+            elog(LOG, "[WRV-%s] tlist resno=%d varno=%d varattno=%d vartype=%u varoattno=%d resname=%s",
+                 phase, tle->resno, v->varno, v->varattno, v->vartype,
+                 v->varoattno, tle->resname ? tle->resname : "?");
+        }
+    }
+}
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -4299,7 +4314,7 @@ CTranslatorDXLToPlStmt::TranslateDXLDynTblScan(
 		&base_table_context,  // translate context for the base table
 		nullptr,			  // translate_ctxt_left and pdxltrctxRight,
 		&plan->targetlist, &query_quals, output_context);
-
+	LogTList("DYNSEQSCAN_AFTER_TRANSLATE", plan->targetlist);
 	// The security quals should always be executed first when compared to
 	// other quals. So appending query quals to the security_query_quals
 	// list after the security quals.
@@ -4393,7 +4408,7 @@ CTranslatorDXLToPlStmt::TranslateDXLDynIdxOnlyScan(
 	dyn_idx_only_scan->indexscan.indexqual = index_cond;
 
 	SetParamIds(plan);
-
+	LogTList("DYNSEQSCAN_AFTER_TRANSLATE", plan->targetlist);
 	return (Plan *) dyn_idx_only_scan;
 }
 
@@ -4487,11 +4502,20 @@ RemapAttrsFromTupDesc(TupleDesc fromDesc, TupleDesc toDesc, Index index,
 	AttrNumber *attMap;
 	attMap = convert_tuples_by_name_map_if_req(toDesc, fromDesc, "unused msg");
 
+	if (attMap) {
+    int natts_from = fromDesc->natts;
+    int natts_to = toDesc->natts;
+    for (int i=0;i<natts_from;i++) {
+        elog(LOG, "[WRV-REMAP] from att %d -> %d (to natts=%d)", i+1, attMap[i], natts_to);
+    }
+}
 	/* If attribute remapping is not necessary, then do not change the varattno */
 	if (attMap)
 	{
 		change_varattnos_of_a_varno((Node *) qual, attMap, index);
+		LogTList("BEFORE_CHANGE_VARATTNOS", targetlist);
 		change_varattnos_of_a_varno((Node *) targetlist, attMap, index);
+		LogTList("AFTER_CHANGE_VARATTNOS", targetlist);
 		fromDesc = toDesc;
 		pfree(attMap);
 	}
@@ -5142,7 +5166,30 @@ CTranslatorDXLToPlStmt::TranslateDXLAssert(
 
 	return (Plan *) assert_node;
 }
+static void
+WRV_DumpDXLTableDescr(const CDXLTableDescr *table_descr)
+{
+    Oid rel_oid = CMDIdGPDB::CastMdid(table_descr->MDId())->Oid();
+    ULONG n = table_descr->Arity();
 
+    elog(LOG, "[WRV-MAP-BUILD] begin table oid=%u columns=%lu", rel_oid, (unsigned long)n);
+
+    for (ULONG i = 0; i < n; ++i)
+    {
+        const CDXLColDescr *descr = table_descr->GetColumnDescrAt(i);
+        const CWStringBase *w = descr->MdName()->GetMDName();
+        char *colname = CTranslatorUtils::CreateMultiByteCharStringFromWCString(w->GetBuffer());
+
+        elog(LOG, "[WRV-MAP-BUILD] idx=%lu colid=%lu name=%s attrnum=%d is_dropped=%d",
+             (unsigned long)i,
+             (unsigned long)descr->Id(),
+             colname,
+             (int)descr->AttrNum(),
+             (int)descr->IsDropped());
+
+        // 如果担心内存，可 pfree(colname); (取决于 CreateMultiByteCharStringFromWCString 的分配方式)
+    }
+}
 //---------------------------------------------------------------------------
 //	@function:
 //		CTranslatorDXLToPlStmt::ProcessDXLTblDescr
@@ -5165,6 +5212,7 @@ CTranslatorDXLToPlStmt::ProcessDXLTblDescr(
 	const CDXLTableDescr *table_descr,
 	CDXLTranslateContextBaseTable *base_table_context)
 {
+	WRV_DumpDXLTableDescr(table_descr);
 	GPOS_ASSERT(nullptr != table_descr);
 
 	BOOL rte_was_translated = false;
@@ -5448,12 +5496,25 @@ CTranslatorDXLToPlStmt::TranslateDXLProjList(
 				}
 			}
 		}
+	// Debug
+	ULONG dxl_colid_for_log = 0;
+	if (EdxlopScalarIdent == expr_dxlnode->GetOperator()->GetDXLOperator())
+		dxl_colid_for_log =
+			CDXLScalarIdent::Cast(expr_dxlnode->GetOperator())->GetDXLColRef()->Id();
 
-		// add column mapping to output translation context
-		output_context->InsertMapping(sc_proj_elem_dxlop->Id(), target_entry);
+	elog(LOG,
+		"[WRV-PROJ] add TLE resno=%d colname=%s isVar=%d attno=%d vartype=%u dxl_colid=%lu",
+		target_entry->resno,
+		target_entry->resname ? target_entry->resname : "?",
+		IsA(expr, Var) ? 1 : 0,
+		(IsA(expr, Var) ? ((Var*)expr)->varattno : -999),
+		(IsA(expr, Var) ? ((Var*)expr)->vartype : 0),
+		dxl_colid_for_log);
+			// add column mapping to output translation context
+			output_context->InsertMapping(sc_proj_elem_dxlop->Id(), target_entry);
 
-		target_list = gpdb::LAppend(target_list, target_entry);
-	}
+			target_list = gpdb::LAppend(target_list, target_entry);
+		}
 
 	return target_list;
 }

@@ -122,6 +122,13 @@ INT
 CDXLTranslateContextBaseTable::GetAttnoForColId(ULONG colid) const
 {
 	const INT *pi = m_colid_to_attno_map->Find(&colid);
+	if (pi == nullptr)
+    {
+        elog(LOG, "[WRV-CTX-LOOKUP-MISS] colid=%lu (no entry)", colid);
+        return 0;
+    }
+	if (*pi == 0)
+        elog(LOG, "[WRV-CTX-LOOKUP-MISS] colid=%lu  mapped=0", colid);
 	if (nullptr != pi)
 	{
 		return *pi;
@@ -143,6 +150,7 @@ CDXLTranslateContextBaseTable::GetAttnoForColId(ULONG colid) const
 BOOL
 CDXLTranslateContextBaseTable::InsertMapping(ULONG dxl_colid, INT att_no)
 {
+	elog(LOG, "[WRV-CTX-INSERT] dxl_colid=%lu -> att_no=%d", dxl_colid, att_no);
 	// copy key and value
 	ULONG *key = GPOS_NEW(m_mp) ULONG(dxl_colid);
 	INT *value = GPOS_NEW(m_mp) INT(att_no);

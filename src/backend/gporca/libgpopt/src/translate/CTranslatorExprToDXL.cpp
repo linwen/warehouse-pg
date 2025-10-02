@@ -15,9 +15,11 @@
 //	@test:
 //
 //---------------------------------------------------------------------------
-
+#define WRV_DEBUG_DTS
 #include "gpopt/translate/CTranslatorExprToDXL.h"
-
+#ifdef WRV_DEBUG_DTS
+#include "gpos/error/CAutoTrace.h"
+#endif
 #include "gpos/common/CAutoTimer.h"
 #include "gpos/common/CHashMap.h"
 
@@ -1359,6 +1361,93 @@ CTranslatorExprToDXL::PdxlnDynamicTableScan(
 	CDXLTableDescr *table_descr =
 		MakeDXLTableDescr(popDTS->Ptabdesc(), pdrgpcrOutput, pexprDTS->Prpp());
 
+		#ifdef WRV_DEBUG_DTS
+    {
+        CAutoTrace at(m_mp);
+        at.Os() << "[WRV-DTS] ---- DynamicTableScan DEBUG (scan id="
+                << popDTS->ScanId() << ") ----" << std::endl;
+
+        // 输出算子声明的输出列 (pdrgpcrOutput)
+        at.Os() << "[WRV-DTS] Output ColRefArray size=" << (unsigned long)pdrgpcrOutput->Size() << std::endl;
+        for (ULONG i = 0; i < pdrgpcrOutput->Size(); ++i)
+        {
+            const CColRef *c = (*pdrgpcrOutput)[i];
+            at.Os() << "[WRV-DTS] OUT idx=" << (unsigned long)i
+                    << " colid=" << (unsigned long)c->Id()
+                    << " name=" << c->Name().Pstr()->GetBuffer()
+                    << std::endl;
+        }
+
+        // TableDescr 列
+        at.Os() << "[WRV-DTS] TableDescr columns=" << (unsigned long)table_descr->Arity() << std::endl;
+        for (ULONG i = 0; i < table_descr->Arity(); ++i)
+        {
+            const CDXLColDescr *d = table_descr->GetColumnDescrAt(i);
+            at.Os() << "[WRV-DTS] TBL idx=" << (unsigned long)i
+                    << " dxl_colid=" << (unsigned long)d->Id()
+                    << " name=" << d->MdName()->GetMDName()->GetBuffer()
+                    << " attrnum=" << (int)d->AttrNum()
+                    << " dropped=" << (int)d->IsDropped()
+                    << std::endl;
+        }
+
+        // 父计划需求列
+        CColRefSet *pcrsReq = pexprDTS->Prpp()->PcrsRequired();
+        at.Os() << "[WRV-DTS] Required-by-parent count=" << (int)pcrsReq->Size() << std::endl;
+
+        // 构造一个 lambda 判断 colid 是否在数组/描述中
+        auto inColRefArray = [](const CColRefArray *arr, ULONG id) -> bool {
+            for (ULONG k=0; k < arr->Size(); ++k)
+                if ((*arr)[k]->Id() == id) return true;
+            return false;
+        };
+        auto inTableDescr = [](const CDXLTableDescr *td, ULONG id) -> bool {
+            for (ULONG k=0; k < td->Arity(); ++k)
+                if (td->GetColumnDescrAt(k)->Id() == id) return true;
+            return false;
+        };
+
+        // 差集：Required - pdrgpcrOutput
+        {
+            bool anyMissing = false;
+            CColRefSetIter it(*pcrsReq);
+            while (it.Advance())
+            {
+                const CColRef *c = it.Pcr();
+                if (!inColRefArray(pdrgpcrOutput, c->Id()))
+                {
+                    anyMissing = true;
+                    at.Os() << "[WRV-DTS] MISSING-IN-OP-OUTPUT colid="
+                            << (unsigned long)c->Id()
+                            << " name=" << c->Name().Pstr()->GetBuffer()
+                            << std::endl;
+                }
+            }
+            if (!anyMissing)
+                at.Os() << "[WRV-DTS] MISSING-IN-OP-OUTPUT none" << std::endl;
+        }
+
+        // 差集：Required - TableDescr
+        {
+            bool anyMissing = false;
+            CColRefSetIter it(*pcrsReq);
+            while (it.Advance())
+            {
+                const CColRef *c = it.Pcr();
+                if (!inTableDescr(table_descr, c->Id()))
+                {
+                    anyMissing = true;
+                    at.Os() << "[WRV-DTS] MISSING-IN-TABLEDESCR colid="
+                            << (unsigned long)c->Id()
+                            << " name=" << c->Name().Pstr()->GetBuffer()
+                            << std::endl;
+                }
+            }
+            if (!anyMissing)
+                at.Os() << "[WRV-DTS] MISSING-IN-TABLEDESCR none" << std::endl;
+        }
+    }
+#endif
 	// construct plan costs
 	CDXLPhysicalProperties *pdxlpropDTS = GetProperties(pexprDTS);
 
@@ -6849,8 +6938,10 @@ CTranslatorExprToDXL::PdxlnFilter(CDXLNode *pdxlnCond)
 
 	return filter_dxlnode;
 }
-
-
+#define WRV_DEBUG_TABLEDESCR
+#ifdef WRV_DEBUG_TABLEDESCR
+#include "gpos/error/CAutoTrace.h"
+#endif
 //---------------------------------------------------------------------------
 //	@function:
 //		CTranslatorExprToDXL::MakeDXLTableDescr
@@ -6861,13 +6952,212 @@ CTranslatorExprToDXL::PdxlnFilter(CDXLNode *pdxlnCond)
 //---------------------------------------------------------------------------
 CDXLTableDescr *
 CTranslatorExprToDXL::MakeDXLTableDescr(
+    const CTableDescriptor *ptabdesc, const CColRefArray *pdrgpcrOutput,
+    const CReqdPropPlan *reqd_prop_plan GPOS_ASSERTS_ONLY)
+{
+    GPOS_ASSERT(nullptr != ptabdesc);
+    GPOS_ASSERT_IMP(nullptr != pdrgpcrOutput,
+                    ptabdesc->ColumnCount() == pdrgpcrOutput->Size());
+
+    CMDName *pmdnameTbl = GPOS_NEW(m_mp) CMDName(m_mp, ptabdesc->Name().Pstr());
+    CMDIdGPDB *mdid = CMDIdGPDB::CastMdid(ptabdesc->MDId());
+    mdid->AddRef();
+
+    CDXLTableDescr *table_descr = GPOS_NEW(m_mp)
+        CDXLTableDescr(m_mp, mdid, pmdnameTbl, ptabdesc->GetExecuteAsUserId(),
+                       ptabdesc->LockMode(), ptabdesc->GetAclMode(),
+                       ptabdesc->GetAssignedQueryIdForTargetRel());
+
+#ifdef WRV_DEBUG_TABLEDESCR
+    CAutoTrace at(m_mp);
+    at.Os() << "[WRV-MAKE-TBL] --- BEGIN --- rel_oid="
+            << CMDIdGPDB::CastMdid(ptabdesc->MDId())->Oid()
+            << " total_columns=" << (unsigned long)ptabdesc->ColumnCount()
+            << (pdrgpcrOutput ? " has_colref_array=1" : " has_colref_array=0")
+            << std::endl;
+    if (reqd_prop_plan && reqd_prop_plan->PcrsRequired())
+    {
+        const CColRefSet *req = reqd_prop_plan->PcrsRequired();
+        at.Os() << "[WRV-MAKE-TBL] required_count=" << (unsigned long)req->Size() << std::endl;
+        CColRefSetIter it(*req);
+        while (it.Advance())
+        {
+            const CColRef *c = it.Pcr();
+            at.Os() << "[WRV-MAKE-TBL] required colid=" << c->Id()
+                    << " name=" << c->Name().Pstr()->GetBuffer() << std::endl;
+        }
+    }
+#endif
+
+    const CColRefSet *required =
+        (reqd_prop_plan ? reqd_prop_plan->PcrsRequired() : nullptr);
+
+    ULONG kept = 0, skipped = 0, rescued = 0;
+    const ULONG ulColumns = ptabdesc->ColumnCount();
+
+    for (ULONG ul = 0; ul < ulColumns; ++ul)
+    {
+        const CColumnDescriptor *pcd = ptabdesc->Pcoldesc(ul);
+        CColRef *colref = nullptr;
+        bool do_skip = false;
+        bool rescue = false;
+
+        if (pdrgpcrOutput)
+        {
+            colref = (*pdrgpcrOutput)[ul];
+            bool required_member = (required && required->FMember(colref));
+            if (colref->GetUsage() != CColRef::EUsed)
+            {
+                if (required_member)
+                {
+                    // 兜底救回
+                    rescue = true;
+                }
+                else
+                {
+                    do_skip = true;
+                }
+            }
+#ifdef WRV_DEBUG_TABLEDESCR
+            if (do_skip)
+            {
+                CAutoTrace at2(m_mp);
+                at2.Os() << "[WRV-MAKE-TBL] SKIP usage!=EUsed col_idx=" << ul
+                         << " colid=" << colref->Id()
+                         << " name=" << pcd->Name().Pstr()->GetBuffer()
+                         << " attrnum=" << pcd->AttrNum()
+                         << " usage=" << (int)colref->GetUsage()
+                         << std::endl;
+            }
+            if (rescue)
+            {
+                CAutoTrace at3(m_mp);
+                at3.Os() << "[WRV-MAKE-TBL] RESCUE required_but_usage_not_used col_idx=" << ul
+                         << " colid=" << colref->Id()
+                         << " name=" << pcd->Name().Pstr()->GetBuffer()
+                         << " attrnum=" << pcd->AttrNum()
+                         << " usage=" << (int)colref->GetUsage()
+                         << std::endl;
+            }
+#endif
+            if (do_skip)
+            {
+#ifdef GPOS_DEBUG
+                // 保留原断言：被跳过列不能在 required
+                GPOS_ASSERT(!required_member);
+#endif
+                skipped++;
+                continue;
+            }
+            if (rescue)
+            {
+                rescued++;
+            }
+        }
+        else
+        {
+            // 不存在输出列数组时，全部生成
+            colref = m_pcf->PcrCreate(pcd->RetrieveType(), pcd->TypeModifier(), pcd->Name());
+        }
+
+        CMDName *pmdnameCol = GPOS_NEW(m_mp) CMDName(m_mp, pcd->Name().Pstr());
+        CMDIdGPDB *pmdidColType =
+            CMDIdGPDB::CastMdid(colref->RetrieveType()->MDId());
+        pmdidColType->AddRef();
+
+        CDXLColDescr *pdxlcd = GPOS_NEW(m_mp) CDXLColDescr(
+            pmdnameCol, colref->Id(), pcd->AttrNum(), pmdidColType,
+            colref->TypeModifier(), false, pcd->Width());
+        table_descr->AddColumnDescr(pdxlcd);
+
+#ifdef WRV_DEBUG_TABLEDESCR
+        CAutoTrace atK(m_mp);
+        atK.Os() << "[WRV-MAKE-TBL] KEEP col_idx=" << ul
+                 << " colid=" << colref->Id()
+                 << " name=" << pcd->Name().Pstr()->GetBuffer()
+                 << " attrnum=" << pcd->AttrNum()
+                 << " usage=" << (int)colref->GetUsage()
+                 << (rescue ? " rescued=1" : "")
+                 << std::endl;
+#endif
+        kept++;
+    }
+
+#ifdef WRV_DEBUG_TABLEDESCR
+    // 二次验证：所有 (required ∩ pdrgpcrOutput) 必须在 table_descr
+    if (required && pdrgpcrOutput)
+    {
+        CColRefSetIter it2(*required);
+        while (it2.Advance())
+        {
+            const CColRef *c = it2.Pcr();
+            bool in_output = false;
+            for (ULONG i=0; i<pdrgpcrOutput->Size() && !in_output; ++i)
+                if ((*pdrgpcrOutput)[i]->Id() == c->Id()) in_output = true;
+            if (!in_output) continue;
+
+            bool in_descr = false;
+            for (ULONG i=0; i<table_descr->Arity() && !in_descr; ++i)
+                if (table_descr->GetColumnDescrAt(i)->Id() == c->Id()) in_descr = true;
+            if (!in_descr)
+            {
+                CAutoTrace atW(m_mp);
+                atW.Os() << "[WRV-MAKE-TBL] ERROR still missing required colid="
+                         << c->Id() << " name=" << c->Name().Pstr()->GetBuffer()
+                         << std::endl;
+#ifdef GPOS_DEBUG
+                GPOS_ASSERT(!"Required column missing after rescue logic");
+#endif
+            }
+        }
+    }
+
+    CAutoTrace atS(m_mp);
+    atS.Os() << "[WRV-MAKE-TBL] SUMMARY kept=" << kept
+             << " skipped=" << skipped
+             << " rescued=" << rescued
+             << " final_tbl_cols=" << (unsigned long)table_descr->Arity()
+             << std::endl
+             << "[WRV-MAKE-TBL] --- END ---" << std::endl;
+#endif
+    return table_descr;
+}
+#if 0
+CDXLTableDescr *
+CTranslatorExprToDXL::MakeDXLTableDescr(
 	const CTableDescriptor *ptabdesc, const CColRefArray *pdrgpcrOutput,
 	const CReqdPropPlan *reqd_prop_plan GPOS_ASSERTS_ONLY)
 {
 	GPOS_ASSERT(nullptr != ptabdesc);
 	GPOS_ASSERT_IMP(nullptr != pdrgpcrOutput,
 					ptabdesc->ColumnCount() == pdrgpcrOutput->Size());
+#ifdef WRV_DEBUG_TABLEDESCR
+    CAutoTrace at(m_mp);
+    at.Os() << "[WRV-MAKE-TBL] --- BEGIN --- "
+            << "rel_oid=" << CMDIdGPDB::CastMdid(ptabdesc->MDId())->Oid()
+            << " total_columns=" << (unsigned long)ptabdesc->ColumnCount()
+            << (pdrgpcrOutput ? " has_colref_array=1" : " has_colref_array=0")
+            << std::endl;
 
+    // 打印 required 集合（父需求）
+    if (reqd_prop_plan && reqd_prop_plan->PcrsRequired())
+    {
+        const CColRefSet *req = reqd_prop_plan->PcrsRequired();
+        at.Os() << "[WRV-MAKE-TBL] required_count=" << (unsigned long)req->Size() << std::endl;
+        CColRefSetIter it(*req);
+        while (it.Advance())
+        {
+            const CColRef *c = it.Pcr();
+            at.Os() << "[WRV-MAKE-TBL] required colid=" << (unsigned long)c->Id()
+                    << " name=" << c->Name().Pstr()->GetBuffer()
+                    << std::endl;
+        }
+    }
+    else
+    {
+        at.Os() << "[WRV-MAKE-TBL] required_count=0 (no reqd_prop_plan or empty)" << std::endl;
+    }
+#endif
 	// get tbl name
 	CMDName *pmdnameTbl = GPOS_NEW(m_mp) CMDName(m_mp, ptabdesc->Name().Pstr());
 
@@ -6880,6 +7170,10 @@ CTranslatorExprToDXL::MakeDXLTableDescr(
 					   ptabdesc->GetAssignedQueryIdForTargetRel());
 
 	const ULONG ulColumns = ptabdesc->ColumnCount();
+	#ifdef WRV_DEBUG_TABLEDESCR
+    ULONG kept = 0;
+    ULONG skipped = 0;
+#endif
 	// translate col descriptors
 	for (ULONG ul = 0; ul < ulColumns; ul++)
 	{
@@ -6889,6 +7183,8 @@ CTranslatorExprToDXL::MakeDXLTableDescr(
 
 		// output col ref for the current col descrs
 		CColRef *colref = nullptr;
+		        bool skip = false;
+        bool is_required_member = false;
 		if (nullptr != pdrgpcrOutput)
 		{
 			colref = (*pdrgpcrOutput)[ul];
@@ -6911,6 +7207,20 @@ CTranslatorExprToDXL::MakeDXLTableDescr(
 			colref = m_pcf->PcrCreate(pcd->RetrieveType(), pcd->TypeModifier(),
 									  pcd->Name());
 		}
+#ifdef WRV_DEBUG_TABLEDESCR
+        if (skip)
+        {
+            skipped++;
+            at.Os() << "[WRV-MAKE-TBL] SKIP col_idx=" << (unsigned long)ul
+                    << " colid=" << (colref ? (unsigned long)colref->Id() : 0UL)
+                    << " name=" << pcd->Name().Pstr()->GetBuffer()
+                    << " attrnum=" << (int)pcd->AttrNum()
+                    << " usage=" << (colref ? (int)colref->GetUsage() : -1)
+                    << (is_required_member ? " ***UNEXPECTED_REQUIRED***" : "")
+                    << std::endl;
+            continue;
+        }
+#endif
 
 		CMDName *pmdnameCol = GPOS_NEW(m_mp) CMDName(m_mp, pcd->Name().Pstr());
 
@@ -6925,11 +7235,68 @@ CTranslatorExprToDXL::MakeDXLTableDescr(
 			colref->TypeModifier(), false /* fdropped */, pcd->Width());
 
 		table_descr->AddColumnDescr(pdxlcd);
+
+#ifdef WRV_DEBUG_TABLEDESCR
+        kept++;
+        at.Os() << "[WRV-MAKE-TBL] KEEP col_idx=" << (unsigned long)ul
+                << " colid=" << (unsigned long)colref->Id()
+                << " name=" << pcd->Name().Pstr()->GetBuffer()
+                << " attrnum=" << (int)pcd->AttrNum()
+                << " usage=" << (int)colref->GetUsage()
+                << std::endl;
+#endif 
+		}	
+
+#ifdef WRV_DEBUG_TABLEDESCR
+    at.Os() << "[WRV-MAKE-TBL] SUMMARY kept=" << kept
+            << " skipped=" << skipped
+            << " final_tbl_cols=" << (unsigned long)table_descr->Arity()
+            << std::endl;
+	
+	if (reqd_prop_plan && reqd_prop_plan->PcrsRequired() && pdrgpcrOutput)
+    {
+        const CColRefSet *req = reqd_prop_plan->PcrsRequired();
+        CColRefSetIter itF(*req);
+        while (itF.Advance())
+        {
+            const CColRef *c = itF.Pcr();
+            // 确认该列在输出数组中
+            bool in_output = false;
+            for (ULONG i=0; i<pdrgpcrOutput->Size() && !in_output; ++i)
+            {
+                if ((*pdrgpcrOutput)[i]->Id() == c->Id())
+                    in_output = true;
+            }
+            if (!in_output)
+                continue; // 父需求列不是当前 scan 输出，跳过
+
+            bool in_table_descr = false;
+            for (ULONG j=0; j<table_descr->Arity() && !in_table_descr; ++j)
+            {
+                if (table_descr->GetColumnDescrAt(j)->Id() == c->Id())
+                    in_table_descr = true;
+            }
+
+            if (!in_table_descr)
+            {
+                at.Os() << "[WRV-MAKE-TBL] WARNING required_col_missing colid="
+                        << (unsigned long)c->Id()
+                        << " name=" << c->Name().Pstr()->GetBuffer()
+                        << std::endl;
+#ifdef GPOS_DEBUG
+                // 如果要强制调试期直接失败，可放开：
+                // GPOS_ASSERT(!"Required column missing from TableDescr");
+#endif
+            }
+        }			
 	}
+
+at.Os() << "[WRV-MAKE-TBL] --- END ---" << std::endl;
+#endif
 
 	return table_descr;
 }
-
+#endif
 //---------------------------------------------------------------------------
 //	@function:
 //		CTranslatorExprToDXL::GetProperties
