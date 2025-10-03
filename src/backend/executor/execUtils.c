@@ -2331,22 +2331,8 @@ change_varattnos_varno_walker(Node *node, const AttrMapContext *attrMapCxt)
 		if (var->varlevelsup == 0 && (var->varno == attrMapCxt->varno) &&
 			var->varattno > 0)
 		{
-            AttrNumber old_attno = var->varattno;
-            AttrNumber mapped = attrMapCxt->newattno[old_attno - 1];
-
-            if (mapped <= 0)
-            {
-                elog(WARNING,
-                     "[WRV-REMAP] invalid mapping varno=%d old_attno=%d mapped=%d vartype=%u (KEEP old)",
-                     var->varno, old_attno, mapped, var->vartype);
-                return false; /* 不更新，防止错误写成 0 */
-            }
-
-            elog(DEBUG1,
-                 "[WRV-REMAP] varno=%d attno %d -> %d vartype=%u",
-                 var->varno, old_attno, mapped, var->vartype);
-
-            var->varattno = var->varoattno = mapped;
+          Assert(attrMapCxt->newattno[var->varattno - 1] > 0);
+          var->varattno = var->varoattno = attrMapCxt->newattno[var->varattno - 1];
 		}
 		return false;
 	}
