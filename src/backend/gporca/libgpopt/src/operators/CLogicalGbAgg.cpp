@@ -22,9 +22,366 @@
 #include "gpopt/operators/CExpressionHandle.h"
 #include "naucrates/statistics/CGroupByStatsProcessor.h"
 
+#define WRV_DEBUG_GBAGG
+#ifdef WRV_DEBUG_GBAGG
+#include "gpos/error/CAutoTrace.h"
+#include "naucrates/md/IMDType.h"
+#endif
+
 using namespace gpopt;
 
+#ifdef WRV_DEBUG_GBAGG
+// 将 usage 枚举转为字符串
+static const WCHAR *
+WrvUsageToSz(CColRef::EUsedStatus us)
+{
+	switch (us)
+	{
+		case CColRef::EUsed: return GPOS_WSZ_LIT("EUsed");
+		case CColRef::EUnused: return GPOS_WSZ_LIT("EUnused");
+		case CColRef::EUnknown: return GPOS_WSZ_LIT("EUnknown");
+		case CColRef::ESentinel: return GPOS_WSZ_LIT("ESentinel");
+	}
+	return GPOS_WSZ_LIT("E<?>");
+}
 
+// 打印一次分组/最小分组/DQA 信息
+static void
+WrvDumpGbAggInitial(const WCHAR *tag,
+					CLogicalGbAgg *op,
+					CColRefArray *pdrgpcrGrp,
+					CColRefArray *pdrgpcrMinimal,
+					CColRefArray *pdrgpcrDQA)
+{
+	CAutoTrace at(COptCtxt::PoctxtFromTLS()->Pmp());
+	at.Os() << GPOS_WSZ_LIT("[WRV-GBAGG] ") << tag
+			<< GPOS_WSZ_LIT(" grp_cols=")
+			<< (ULONG)(pdrgpcrGrp ? pdrgpcrGrp->Size() : 0)
+			<< GPOS_WSZ_LIT(" minimal_cols=")
+			<< (ULONG)(pdrgpcrMinimal ? pdrgpcrMinimal->Size() : 0)
+			<< GPOS_WSZ_LIT(" dqa_arg_cols=")
+			<< (ULONG)(pdrgpcrDQA ? pdrgpcrDQA->Size() : 0)
+			<< GPOS_WSZ_LIT(" agg_type=") << (INT) op->Egbaggtype()
+			<< GPOS_WSZ_LIT(" agg_stage=") << (INT) op->AggStage()
+			<< GPOS_WSZ_LIT(" generates_dup=")
+			<< (op->FGeneratesDuplicates() ? 1 : 0)
+			<< std::endl;
+
+	if (pdrgpcrGrp)
+	{
+		for (ULONG i=0; i<pdrgpcrGrp->Size(); ++i)
+		{
+			CColRef *c = (*pdrgpcrGrp)[i];
+			at.Os() << GPOS_WSZ_LIT("[WRV-GBAGG] GROUP idx=") << i
+					<< GPOS_WSZ_LIT(" colid=") << c->Id()
+					<< GPOS_WSZ_LIT(" name=") << c->Name().Pstr()->GetBuffer()
+					<< GPOS_WSZ_LIT(" usage=") << WrvUsageToSz(c->GetUsage())
+					<< GPOS_WSZ_LIT(" system=") << (c->IsSystemCol() ? 1 : 0)
+					<< GPOS_WSZ_LIT(" dist=") << (c->IsDistCol() ? 1 : 0)
+					<< GPOS_WSZ_LIT(" type_oid=")
+					<< CMDIdGPDB::CastMdid(c->RetrieveType()->MDId())->Oid()
+					<< std::endl;
+		}
+	}
+	if (pdrgpcrMinimal && pdrgpcrMinimal != pdrgpcrGrp)
+	{
+		for (ULONG i=0; i<pdrgpcrMinimal->Size(); ++i)
+		{
+			CColRef *c = (*pdrgpcrMinimal)[i];
+			at.Os() << GPOS_WSZ_LIT("[WRV-GBAGG] MINIMAL idx=") << i
+					<< GPOS_WSZ_LIT(" colid=") << c->Id()
+					<< GPOS_WSZ_LIT(" name=") << c->Name().Pstr()->GetBuffer()
+					<< GPOS_WSZ_LIT(" usage=") << WrvUsageToSz(c->GetUsage())
+					<< std::endl;
+		}
+	}
+	if (pdrgpcrDQA)
+	{
+		for (ULONG i=0; i<pdrgpcrDQA->Size(); ++i)
+		{
+			CColRef *c = (*pdrgpcrDQA)[i];
+			at.Os() << GPOS_WSZ_LIT("[WRV-GBAGG] DQA_ARG idx=") << i
+					<< GPOS_WSZ_LIT(" colid=") << c->Id()
+					<< GPOS_WSZ_LIT(" name=") << c->Name().Pstr()->GetBuffer()
+					<< GPOS_WSZ_LIT(" usage=") << WrvUsageToSz(c->GetUsage())
+					<< std::endl;
+		}
+	}
+}
+#endif // WRV_DEBUG_GBAGG
+
+
+// 原 pattern ctor
+CLogicalGbAgg::CLogicalGbAgg(CMemoryPool *mp)
+	: CLogicalUnary(mp),
+	  m_fGeneratesDuplicates(true),
+	  m_pdrgpcrArgDQA(nullptr),
+	  m_pdrgpcr(nullptr),
+	  m_pdrgpcrMinimal(nullptr),
+	  m_egbaggtype(COperator::EgbaggtypeSentinel),
+	  m_aggStage(EasOthers)
+{
+	m_fPattern = true;
+}
+#include <execinfo.h>
+static void WrvPrintStack(IOstream &os)
+{
+    void *addrs[64];
+    int n = backtrace(addrs, 64);
+    char **syms = backtrace_symbols(addrs, n);
+    if (syms)
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            os << "[WRV-GBAGG-STACK] " << syms[i] << std::endl;
+        }
+        free(syms);
+    }
+}
+CLogicalGbAgg::CLogicalGbAgg(CMemoryPool *mp, CColRefArray *colref_array,
+							 COperator::EGbAggType egbaggtype)
+	: CLogicalUnary(mp),
+	  m_fGeneratesDuplicates(false),
+	  m_pdrgpcrArgDQA(nullptr),
+	  m_pdrgpcr(colref_array),
+	  m_pdrgpcrMinimal(nullptr),
+	  m_egbaggtype(egbaggtype),
+	  m_aggStage(EasOthers)
+{
+	if (COperator::EgbaggtypeLocal == egbaggtype)
+	{
+		m_fGeneratesDuplicates = true;
+	}
+	GPOS_ASSERT(nullptr != colref_array);
+	GPOS_ASSERT(COperator::EgbaggtypeSentinel > egbaggtype);
+	GPOS_ASSERT(COperator::EgbaggtypeIntermediate != egbaggtype);
+	m_pcrsLocalUsed->Include(m_pdrgpcr);
+
+#ifdef WRV_DEBUG_GBAGG
+	WrvDumpGbAggInitial(GPOS_WSZ_LIT("CTOR1"), this, m_pdrgpcr, m_pdrgpcrMinimal, m_pdrgpcrArgDQA);
+	if (m_pdrgpcr && m_pdrgpcr->Size() == 4)
+{
+    CAutoTrace at(mp);
+    at.Os() << "[WRV-GBAGG-STACK] ctor5_size4 callstack BEGIN" << std::endl;
+    WrvPrintStack(at.Os());
+    at.Os() << "[WRV-GBAGG-STACK] ctor5_size4 callstack END" << std::endl;
+}
+#endif
+}
+
+CLogicalGbAgg::CLogicalGbAgg(CMemoryPool *mp, CColRefArray *colref_array,
+							 COperator::EGbAggType egbaggtype,
+							 EAggStage aggStage)
+	: CLogicalUnary(mp),
+	  m_fGeneratesDuplicates(false),
+	  m_pdrgpcrArgDQA(nullptr),
+	  m_pdrgpcr(colref_array),
+	  m_pdrgpcrMinimal(nullptr),
+	  m_egbaggtype(egbaggtype),
+	  m_aggStage(aggStage)
+{
+	if (COperator::EgbaggtypeLocal == egbaggtype)
+	{
+		m_fGeneratesDuplicates = true;
+	}
+	GPOS_ASSERT(nullptr != colref_array);
+	GPOS_ASSERT(COperator::EgbaggtypeSentinel > egbaggtype);
+	GPOS_ASSERT(COperator::EgbaggtypeIntermediate != egbaggtype);
+	m_pcrsLocalUsed->Include(m_pdrgpcr);
+
+#ifdef WRV_DEBUG_GBAGG
+	WrvDumpGbAggInitial(GPOS_WSZ_LIT("CTOR2"), this, m_pdrgpcr, m_pdrgpcrMinimal, m_pdrgpcrArgDQA);
+#endif
+}
+
+CLogicalGbAgg::CLogicalGbAgg(CMemoryPool *mp, CColRefArray *colref_array,
+							 COperator::EGbAggType egbaggtype,
+							 BOOL fGeneratesDuplicates,
+							 CColRefArray *pdrgpcrArgDQA)
+	: CLogicalUnary(mp),
+	  m_fGeneratesDuplicates(fGeneratesDuplicates),
+	  m_pdrgpcrArgDQA(pdrgpcrArgDQA),
+	  m_pdrgpcr(colref_array),
+	  m_pdrgpcrMinimal(nullptr),
+	  m_egbaggtype(egbaggtype),
+	  m_aggStage(EasOthers)
+{
+	GPOS_ASSERT(nullptr != colref_array);
+	GPOS_ASSERT(COperator::EgbaggtypeSentinel > egbaggtype);
+	GPOS_ASSERT_IMP(nullptr == m_pdrgpcrArgDQA,
+					COperator::EgbaggtypeIntermediate != egbaggtype);
+	GPOS_ASSERT_IMP(m_fGeneratesDuplicates,
+					COperator::EgbaggtypeLocal == egbaggtype);
+	m_pcrsLocalUsed->Include(m_pdrgpcr);
+
+#ifdef WRV_DEBUG_GBAGG
+	WrvDumpGbAggInitial(GPOS_WSZ_LIT("CTOR3"), this, m_pdrgpcr, m_pdrgpcrMinimal, m_pdrgpcrArgDQA);
+#endif
+}
+
+CLogicalGbAgg::CLogicalGbAgg(CMemoryPool *mp, CColRefArray *colref_array,
+							 COperator::EGbAggType egbaggtype,
+							 BOOL fGeneratesDuplicates,
+							 CColRefArray *pdrgpcrArgDQA, EAggStage aggStage)
+	: CLogicalUnary(mp),
+	  m_fGeneratesDuplicates(fGeneratesDuplicates),
+	  m_pdrgpcrArgDQA(pdrgpcrArgDQA),
+	  m_pdrgpcr(colref_array),
+	  m_pdrgpcrMinimal(nullptr),
+	  m_egbaggtype(egbaggtype),
+	  m_aggStage(aggStage)
+{
+	GPOS_ASSERT(nullptr != colref_array);
+	GPOS_ASSERT(COperator::EgbaggtypeSentinel > egbaggtype);
+	GPOS_ASSERT_IMP(nullptr == m_pdrgpcrArgDQA,
+					COperator::EgbaggtypeIntermediate != egbaggtype);
+	GPOS_ASSERT_IMP(m_fGeneratesDuplicates,
+					COperator::EgbaggtypeLocal == egbaggtype);
+	m_pcrsLocalUsed->Include(m_pdrgpcr);
+
+#ifdef WRV_DEBUG_GBAGG
+	WrvDumpGbAggInitial(GPOS_WSZ_LIT("CTOR4"), this, m_pdrgpcr, m_pdrgpcrMinimal, m_pdrgpcrArgDQA);
+#endif
+}
+
+CLogicalGbAgg::CLogicalGbAgg(CMemoryPool *mp, CColRefArray *colref_array,
+							 CColRefArray *pdrgpcrMinimal,
+							 COperator::EGbAggType egbaggtype)
+	: CLogicalUnary(mp),
+	  m_fGeneratesDuplicates(true),
+	  m_pdrgpcrArgDQA(nullptr),
+	  m_pdrgpcr(colref_array),
+	  m_pdrgpcrMinimal(pdrgpcrMinimal),
+	  m_egbaggtype(egbaggtype),
+	  m_aggStage(EasOthers)
+{
+	GPOS_ASSERT(nullptr != colref_array);
+	GPOS_ASSERT(COperator::EgbaggtypeSentinel > egbaggtype);
+	GPOS_ASSERT(COperator::EgbaggtypeIntermediate != egbaggtype);
+	GPOS_ASSERT_IMP(nullptr != pdrgpcrMinimal,
+					pdrgpcrMinimal->Size() <= colref_array->Size());
+
+	if (nullptr == pdrgpcrMinimal)
+	{
+		m_pdrgpcr->AddRef();
+		m_pdrgpcrMinimal = m_pdrgpcr;
+	}
+	m_pcrsLocalUsed->Include(m_pdrgpcr);
+
+#ifdef WRV_DEBUG_GBAGG
+	WrvDumpGbAggInitial(GPOS_WSZ_LIT("CTOR5"), this, m_pdrgpcr, m_pdrgpcrMinimal, m_pdrgpcrArgDQA);
+#endif
+// 在 CTOR5 构造体里（grp_cols=4 那个版本之后）：
+#ifdef WRV_DEBUG_GBAGG
+if (m_pdrgpcr && m_pdrgpcr->Size() == 4)
+{
+    CAutoTrace at(mp);
+    at.Os() << "[WRV-GBAGG-STACK] ctor5_size4 callstack BEGIN" << std::endl;
+    WrvPrintStack(at.Os());
+    at.Os() << "[WRV-GBAGG-STACK] ctor5_size4 callstack END" << std::endl;
+}
+#endif
+}
+
+CLogicalGbAgg::CLogicalGbAgg(CMemoryPool *mp, CColRefArray *colref_array,
+							 CColRefArray *pdrgpcrMinimal,
+							 COperator::EGbAggType egbaggtype,
+							 BOOL fGeneratesDuplicates,
+							 CColRefArray *pdrgpcrArgDQA)
+	: CLogicalUnary(mp),
+	  m_fGeneratesDuplicates(fGeneratesDuplicates),
+	  m_pdrgpcrArgDQA(pdrgpcrArgDQA),
+	  m_pdrgpcr(colref_array),
+	  m_pdrgpcrMinimal(pdrgpcrMinimal),
+	  m_egbaggtype(egbaggtype),
+	  m_aggStage(EasOthers)
+{
+	GPOS_ASSERT(nullptr != colref_array);
+	GPOS_ASSERT(COperator::EgbaggtypeSentinel > egbaggtype);
+	GPOS_ASSERT_IMP(nullptr != pdrgpcrMinimal,
+					pdrgpcrMinimal->Size() <= colref_array->Size());
+	GPOS_ASSERT_IMP(nullptr == m_pdrgpcrArgDQA,
+					COperator::EgbaggtypeIntermediate != egbaggtype);
+	GPOS_ASSERT_IMP(m_fGeneratesDuplicates,
+					COperator::EgbaggtypeLocal == egbaggtype);
+
+	if (nullptr == pdrgpcrMinimal)
+	{
+		m_pdrgpcr->AddRef();
+		m_pdrgpcrMinimal = m_pdrgpcr;
+	}
+	m_pcrsLocalUsed->Include(m_pdrgpcr);
+
+#ifdef WRV_DEBUG_GBAGG
+	WrvDumpGbAggInitial(GPOS_WSZ_LIT("CTOR6"), this, m_pdrgpcr, m_pdrgpcrMinimal, m_pdrgpcrArgDQA);
+#endif
+}
+
+// ------------------ 下面保持原有函数不变，只在 DeriveOutputColumns 末尾加调试 ------------------
+
+CLogicalGbAgg::~CLogicalGbAgg()
+{
+	CRefCount::SafeRelease(m_pdrgpcr);
+	CRefCount::SafeRelease(m_pdrgpcrMinimal);
+	CRefCount::SafeRelease(m_pdrgpcrArgDQA);
+}
+
+COperator *
+CLogicalGbAgg::PopCopyWithRemappedColumns(CMemoryPool *mp,
+										  UlongToColRefMap *colref_mapping,
+										  BOOL must_exist)
+{
+	// 原逻辑不改
+	CColRefArray *colref_array =
+		CUtils::PdrgpcrRemap(mp, m_pdrgpcr, colref_mapping, must_exist);
+	CColRefArray *pdrgpcrMinimal = nullptr;
+	if (nullptr != m_pdrgpcrMinimal)
+	{
+		pdrgpcrMinimal = CUtils::PdrgpcrRemap(
+			mp, m_pdrgpcrMinimal, colref_mapping, must_exist);
+	}
+	CColRefArray *pdrgpcrArgDQA = nullptr;
+	if (nullptr != m_pdrgpcrArgDQA)
+	{
+		pdrgpcrArgDQA = CUtils::PdrgpcrRemap(
+			mp, m_pdrgpcrArgDQA, colref_mapping, must_exist);
+	}
+
+	return GPOS_NEW(mp)
+		CLogicalGbAgg(mp, colref_array, pdrgpcrMinimal, Egbaggtype(),
+					  m_fGeneratesDuplicates, pdrgpcrArgDQA);
+}
+
+CColRefSet *
+CLogicalGbAgg::DeriveOutputColumns(CMemoryPool *mp, CExpressionHandle &exprhdl)
+{
+	GPOS_ASSERT(2 == exprhdl.Arity());
+
+	CColRefSet *pcrs = GPOS_NEW(mp) CColRefSet(mp);
+	pcrs->Include(Pdrgpcr());
+	pcrs->Intersection(exprhdl.DeriveOutputColumns(0));
+	pcrs->Union(exprhdl.DeriveDefinedColumns(1));
+
+#ifdef WRV_DEBUG_GBAGG
+	{
+		CAutoTrace at(mp);
+		at.Os() << GPOS_WSZ_LIT("[WRV-GBAGG] DeriveOutputColumns grp_cols=")
+				<< (ULONG)m_pdrgpcr->Size()
+				<< GPOS_WSZ_LIT(" final_output_cols=")
+				<< (ULONG)pcrs->Size()
+				<< std::endl;
+
+		// 如果分组列数 == 输出列数，可标个提示（可能是 broad grouping）
+		if (pcrs->Size() == m_pdrgpcr->Size() && pcrs->Size() > 0)
+		{
+			at.Os() << GPOS_WSZ_LIT("[WRV-GBAGG] NOTE output == group_cols (check if whole-row or over-grouping)")
+					<< std::endl;
+		}
+	}
+#endif
+	return pcrs;
+}
+#if 0
 //---------------------------------------------------------------------------
 //	@function:
 //		CLogicalGbAgg::CLogicalGbAgg
@@ -305,7 +662,7 @@ CLogicalGbAgg::DeriveOutputColumns(CMemoryPool *mp, CExpressionHandle &exprhdl)
 
 	return pcrs;
 }
-
+#endif
 //---------------------------------------------------------------------------
 //	@function:
 //		CLogicalGbAgg::DeriveOuterReferences
