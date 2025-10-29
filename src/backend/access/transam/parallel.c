@@ -1320,6 +1320,7 @@ ParallelWorkerMain(Datum main_arg)
 	Gp_role = GP_ROLE_EXECUTE;
 	gp_session_id = fps->session_id;
 	MyProc->mppSessionId = gp_session_id;
+	MyProc->mppIsWriter = false;
 	numsegmentsFromQD = fps->num_segments;
 
 	/*
