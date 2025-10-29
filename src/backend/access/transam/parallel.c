@@ -196,6 +196,139 @@ CreateParallelContext(const char *library_name, const char *function_name,
 	return pcxt;
 }
 
+void
+PrintSnapshot(Snapshot snapshot)
+{
+	int i;
+
+	if (!snapshot)
+	{
+		elog(LOG, "===> PrintSnapshot: snapshot is NULL");
+		return;
+	}
+
+	elog(LOG, "===> Snapshot header: xmin=%u xmax=%u xcnt=%u subxcnt=%d suboverflowed=%s haveDistribSnapshot=%s curcid=%u",
+		 (unsigned int) snapshot->xmin,
+		 (unsigned int) snapshot->xmax,
+		 (unsigned int) snapshot->xcnt,
+		 (int) snapshot->subxcnt,
+		 snapshot->suboverflowed ? "true" : "false",
+		 snapshot->haveDistribSnapshot ? "true" : "false",
+		 (unsigned int) snapshot->curcid);
+
+	/* print xip */
+	for (i = 0; i < snapshot->xcnt; i++)
+	{
+		elog(LOG, "===> xip[%d] = %u", i, (unsigned int) snapshot->xip[i]);
+	}
+
+	/* print subxip */
+	for (i = 0; i < snapshot->subxcnt; i++)
+	{
+		elog(LOG, "===> subxip[%d] = %u", i, (unsigned int) snapshot->subxip[i]);
+	}
+
+	/* print distributed snapshot if present */
+	if (snapshot->haveDistribSnapshot)
+	{
+		DistributedSnapshot *ds = &snapshot->distribSnapshotWithLocalMapping.ds;
+
+		elog(LOG, "===> Distributed snapshot header: xminAll=%u distribSnapshotId=%u xmin=%u xmax=%u count=%d",
+			 (unsigned int) ds->xminAllDistributedSnapshots,
+			 (unsigned int) ds->distribSnapshotId,
+			 (unsigned int) ds->xmin,
+			 (unsigned int) ds->xmax,
+			 (int) ds->count);
+
+		for (i = 0; i < ds->count; i++)
+			elog(LOG, "===> inProgressXidArray[%d] = %u", i, (unsigned int) ds->inProgressXidArray[i]);
+	}
+}
+
+Snapshot
+CreateTestSnapshot(int xcnt, int subxcnt, int ds_count)
+{
+	Size		size;
+	Snapshot	snapshot;
+	int			i;
+
+	/* base space for SnapshotData + xip + subxip */
+	size = sizeof(SnapshotData)
+		+ xcnt * sizeof(TransactionId)
+		+ subxcnt * sizeof(TransactionId);
+
+	/* allocate snapshot header + xip + subxip in TopTransactionContext */
+	snapshot = (Snapshot) MemoryContextAlloc(TopTransactionContext, size);
+
+	/* zero the whole region for deterministic content */
+	memset(snapshot, 0, size);
+
+	/* basic snapshot header */
+	snapshot->snapshot_type = SNAPSHOT_MVCC;
+	snapshot->xmin = 100;   /* arbitrary test values */
+	snapshot->xmax = 1000;
+	snapshot->xcnt = xcnt;
+	snapshot->subxcnt = subxcnt;
+	snapshot->suboverflowed = false;
+	snapshot->takenDuringRecovery = false;
+	snapshot->curcid = 1;
+	snapshot->whenTaken = GetCurrentTimestamp();
+	snapshot->lsn = 0;
+	snapshot->haveDistribSnapshot = (ds_count > 0) ? true : false;
+
+	/* populate xip immediately after SnapshotData */
+	if (xcnt > 0)
+	{
+		snapshot->xip = (TransactionId *) (snapshot + 1);
+		for (i = 0; i < xcnt; i++)
+			snapshot->xip[i] = (TransactionId) (1000 + i); /* 1000,1001,... */
+	}
+	else
+		snapshot->xip = NULL;
+
+	/* populate subxip right after xip */
+	if (subxcnt > 0)
+	{
+		snapshot->subxip = ((TransactionId *) (snapshot + 1)) + xcnt;
+		for (i = 0; i < subxcnt; i++)
+			snapshot->subxip[i] = (TransactionId) (2000 + i); /* 2000,2001,... */
+	}
+	else
+		snapshot->subxip = NULL;
+
+	/* distributed snapshot: allocate inProgressXidArray separately */
+	if (ds_count > 0)
+	{
+		DistributedSnapshot *ds = &snapshot->distribSnapshotWithLocalMapping.ds;
+
+		/* fill ds header fields with deterministic test values */
+		ds->xminAllDistributedSnapshots = 10;
+		ds->distribSnapshotId = 42;
+		ds->xmin = 50;
+		ds->xmax = 150;
+		ds->count = ds_count;
+
+		/* allocate array separately in TopTransactionContext */
+		ds->inProgressXidArray = (DistributedTransactionId *)
+			MemoryContextAlloc(TopTransactionContext,
+							   ds_count * sizeof(DistributedTransactionId));
+
+		for (i = 0; i < ds_count; i++)
+			ds->inProgressXidArray[i] = (DistributedTransactionId) (3000 + i); /* 3000,3001,... */
+	}
+	else
+	{
+		memset(&snapshot->distribSnapshotWithLocalMapping, 0, sizeof(DistributedSnapshotWithLocalMapping));
+	}
+
+	/* mark counts/copy flags consistent with restored snapshots */
+	snapshot->regd_count = 0;
+	snapshot->active_count = 0;
+	snapshot->copied = false;
+
+	return snapshot;
+}
+
 /*
  * Establish the dynamic shared memory segment for a parallel context and
  * copy state and other bookkeeping information that will be needed by
@@ -220,7 +353,8 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	FixedParallelState *fps;
 	dsm_handle	session_dsm_handle = DSM_HANDLE_INVALID;
 	Snapshot	transaction_snapshot = GetTransactionSnapshot();
-	Snapshot	active_snapshot = GetActiveSnapshot();
+	//Snapshot	active_snapshot = GetActiveSnapshot();
+	Snapshot	active_snapshot = CreateTestSnapshot(2,3,0);
 
 	/* We might be running in a very short-lived memory context. */
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
@@ -1471,6 +1605,7 @@ ParallelWorkerMain(Datum main_arg)
 	tsnapspace = shm_toc_lookup(toc, PARALLEL_KEY_TRANSACTION_SNAPSHOT, true);
 	asnapshot = RestoreSnapshot(asnapspace);
 	tsnapshot = tsnapspace ? RestoreSnapshot(tsnapspace) : asnapshot;
+	PrintSnapshot(tsnapshot);
 	RestoreTransactionSnapshot(tsnapshot,
 							   fps->parallel_leader_pgproc);
 	PushActiveSnapshot(asnapshot);
