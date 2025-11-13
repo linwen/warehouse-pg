@@ -354,7 +354,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	dsm_handle	session_dsm_handle = DSM_HANDLE_INVALID;
 	Snapshot	transaction_snapshot = GetTransactionSnapshot();
 	//Snapshot	active_snapshot = GetActiveSnapshot();
-	Snapshot	active_snapshot = CreateTestSnapshot(2,3,0);
+	Snapshot	active_snapshot = CreateTestSnapshot(3,4,0);
 
 	/* We might be running in a very short-lived memory context. */
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
