@@ -1073,6 +1073,9 @@ _outHashJoin(StringInfo str, const HashJoin *node)
 	WRITE_NODE_FIELD(hashoperators);
 	WRITE_NODE_FIELD(hashcollations);
 	WRITE_NODE_FIELD(hashkeys);
+	WRITE_NODE_FIELD(rf_paramids);
+	WRITE_INT_FIELD(rf_decline);
+	WRITE_INT_FIELD(rf_keyidx);
 }
 
 static void

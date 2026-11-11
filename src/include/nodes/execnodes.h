@@ -2379,6 +2379,15 @@ typedef struct HashJoinState
 	/* set if the operator created workfiles */
 	bool workfiles_created;
 	bool reuse_hashtable; /* Do we need to preserve hash table to support rescan */
+
+	/*
+	 * WHPG: the exec Param this join sets to a runtime filter for the probe
+	 * scan (planrtfilter.c), or -1; the hash key the filter is over; and the
+	 * filter it points to, if built.
+	 */
+	int			hj_rfParamId;
+	int			hj_rfKeyIdx;
+	struct varlena *hj_rfFilter;
 } HashJoinState;
 
 
@@ -2826,6 +2835,13 @@ typedef struct HashState
 
 	/* Parallel hash state. */
 	struct ParallelHashJoinState *parallel_state;
+
+	/*
+	 * WHPG: collects the hash values for the probe scan's runtime filter,
+	 * over the hash key at rf_keyidx (HashJoin.rf_keyidx).
+	 */
+	struct RuntimeFilterBuilder *rf_builder;
+	int			rf_keyidx;
 } HashState;
 
 /* ----------------

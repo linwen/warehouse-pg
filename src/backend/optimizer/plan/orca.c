@@ -237,6 +237,16 @@ optimize_query(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	stagedscan_decide_orca_plan(glob, result, parse->hasRowSecurity);
 
 	/*
+	 * WHPG: runtime filters for hash joins whose probe scan is in the same
+	 * slice (planrtfilter.c). Where one is added to an AOCO scan the Staged
+	 * Scan is decided again with it, hence after the pass above. ORCA's
+	 * range table is final and flat, so the subplans are walked too.
+	 */
+	runtimefilter_decide_plan(glob, result->planTree, result->subplans,
+							  result->rtable, &result->paramExecTypes,
+							  true, parse->hasRowSecurity);
+
+	/*
 	 * To save on memory, and on the network bandwidth when the plan is
 	 * dispatched to QEs, strip all subquery RTEs of the original Query
 	 * objects.

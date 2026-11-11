@@ -3212,6 +3212,9 @@ _readHashJoin(void)
 	READ_NODE_FIELD(hashoperators);
 	READ_NODE_FIELD(hashcollations);
 	READ_NODE_FIELD(hashkeys);
+	READ_NODE_FIELD(rf_paramids);
+	READ_INT_FIELD(rf_decline);
+	READ_INT_FIELD(rf_keyidx);
 
 	READ_DONE();
 }

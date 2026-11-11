@@ -118,6 +118,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/memutils.h"
+#include "utils/runtimefilter.h"
 #include "utils/sharedtuplestore.h"
 
 #include "cdb/cdbvars.h"
@@ -164,6 +165,78 @@ static bool ExecHashJoinReloadHashTable(HashJoinState *hjstate);
 static void ExecEagerFreeHashJoin(HashJoinState *node);
 
 static inline void SaveWorkFileSetStatsInfo(HashJoinTable hashtable);
+
+/*
+ * WHPG: the runtime filter for the probe side (planrtfilter.c).
+ *
+ * The planner gave this join an exec Param that the probe scan's qual reads
+ * through whpg_rf_match(). While the Hash node builds the table it inserts
+ * every hash value into a filter (nodeHash.c); once the table is complete
+ * the join points the Param at the finished filter, before it reads a
+ * single probe row. A NULL Param means "no filter" -- not built yet, dropped
+ * as too dense for the keys it got, or a Parallel Hash, whose table several
+ * processes build -- and lets every row through.
+ */
+static void
+ExecHashJoinResetRuntimeFilter(HashJoinState *node)
+{
+	EState	   *estate = node->js.ps.state;
+	ParamExecData *prm;
+
+	if (node->hj_rfParamId < 0)
+		return;
+
+	Assert(estate->es_param_exec_vals != NULL);
+	prm = &estate->es_param_exec_vals[node->hj_rfParamId];
+	prm->execPlan = NULL;
+	prm->value = (Datum) 0;
+	prm->isnull = true;
+	if (node->hj_rfFilter != NULL)
+	{
+		pfree(node->hj_rfFilter);
+		node->hj_rfFilter = NULL;
+	}
+}
+
+static void
+ExecHashJoinStartRuntimeFilter(HashJoinState *node, HashState *hashNode,
+							   bool parallel)
+{
+	EState	   *estate = node->js.ps.state;
+
+	if (node->hj_rfParamId < 0)
+		return;
+
+	ExecHashJoinResetRuntimeFilter(node);
+	if (!parallel)
+	{
+		hashNode->rf_builder =
+			runtimefilter_create(hashNode->ps.plan->plan_rows,
+								 estate->es_query_cxt);
+		hashNode->rf_keyidx = node->hj_rfKeyIdx;
+	}
+}
+
+static void
+ExecHashJoinPublishRuntimeFilter(HashJoinState *node, HashState *hashNode)
+{
+	EState	   *estate = node->js.ps.state;
+	ParamExecData *prm;
+
+	if (node->hj_rfParamId < 0)
+		return;
+
+	if (hashNode->rf_builder != NULL)
+	{
+		node->hj_rfFilter = runtimefilter_finish(hashNode->rf_builder);
+		hashNode->rf_builder = NULL;
+	}
+
+	prm = &estate->es_param_exec_vals[node->hj_rfParamId];
+	prm->execPlan = NULL;
+	prm->value = PointerGetDatum(node->hj_rfFilter);
+	prm->isnull = (node->hj_rfFilter == NULL);
+}
 
 /* ----------------------------------------------------------------
  *		ExecHashJoinImpl
@@ -290,6 +363,16 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 						 */
 						node->hj_FirstOuterTupleSlot = NULL;
 					}
+					else if (node->hj_rfParamId >= 0)
+					{
+						/*
+						 * WHPG: the probe scan filters on the hash table's
+						 * keys, so the table is built first and every probe
+						 * row, the first included, is read through the
+						 * filter (ExecHashJoinPublishRuntimeFilter()).
+						 */
+						node->hj_FirstOuterTupleSlot = NULL;
+					}
 					else if (HJ_FILL_OUTER(node) ||
 						 (outerNode->plan->startup_cost < hashNode->ps.plan->total_cost &&
 						  !node->hj_OuterNotEmpty))
@@ -348,7 +431,9 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				 * arrived too late.
 				 */
 				hashNode->hashtable = hashtable;
+				ExecHashJoinStartRuntimeFilter(node, hashNode, parallel);
 				(void) MultiExecProcNode((PlanState *) hashNode);
+				ExecHashJoinPublishRuntimeFilter(node, hashNode);
 
 #ifdef HJDEBUG
 				elog(gp_workfile_caching_loglevel, "HashJoin built table with %.1f tuples by executing subplan for batch 0", hashtable->totalTuples);
@@ -807,6 +892,17 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	 * the fix to MPP-989)
 	 */
 	hjstate->prefetch_inner = node->join.prefetch_inner;
+
+	/*
+	 * WHPG: the runtime filter Param reads as "no filter" until the hash
+	 * table is built; set it before the children are initialized, as the
+	 * probe scan's qual reads it.
+	 */
+	hjstate->hj_rfParamId =
+		node->rf_paramids != NIL ? linitial_int(node->rf_paramids) : -1;
+	hjstate->hj_rfKeyIdx = node->rf_keyidx;
+	hjstate->hj_rfFilter = NULL;
+	ExecHashJoinResetRuntimeFilter(hjstate);
 
 	/*
 	 * initialize child nodes
@@ -1653,6 +1749,9 @@ ExecReScanHashJoin(HashJoinState *node)
 
 			node->hj_HashTable = NULL;
 			node->hj_JoinState = HJ_BUILD_HASHTABLE;
+
+			/* WHPG: the filter described the old table; the rebuild makes a new one */
+			ExecHashJoinResetRuntimeFilter(node);
 
 			/*
 			 * if chgParam of subnode is not null then plan will be re-scanned

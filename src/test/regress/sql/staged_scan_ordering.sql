@@ -275,6 +275,10 @@ SELECT gio_same('SELECT count(*) || '':'' || sum(a) FROM gp_adapt WHERE p = 1 AN
 -- above keep 3% against a planted 0.1% and stay under twice the gate, so
 -- they do not.
 SELECT gio_stages('SELECT c FROM gp_ord WHERE d % 2 = 0 AND s + 0 = 1') AS expression_leads;
+-- The tables are small, and a segment file Phase A reads to its end is never
+-- handed back; arm the first-batch checks on the first block, as a 64-block
+-- segment file would arm them.
+SET whpg_staged_scan_density_min_blocks = 1;
 SELECT gio_arm('StagedScan_PhaseA_EstimateFallback', 'gp_ord');
 SELECT count(c) FROM gp_ord WHERE d % 2 = 0 AND s + 0 = 1;
 SELECT gio_hits('StagedScan_PhaseA_EstimateFallback') AS estimate_fallbacks_expression;
@@ -284,14 +288,15 @@ SELECT count(c) FROM gp_adapt WHERE p = 1 AND q = 1 AND r = 1;
 SELECT gio_hits('StagedScan_PhaseA_EstimateFallback') AS estimate_fallbacks_misled;
 SELECT gio_reset('StagedScan_PhaseA_EstimateFallback');
 SELECT gio_same('SELECT count(*) || '':'' || sum(b) FROM gp_ord WHERE d % 2 = 0 AND s + 0 = 1') AS same_after_estimate_fallback;
+RESET whpg_staged_scan_density_min_blocks;
 
 -- A fallback hands the rest of the scan to the ordinary scan, and EXPLAIN
--- ANALYZE counts every segment file it read. p = 1 is planted at 0.1% and
--- really keeps one row in thirty; with the selectivity gate at 2% the
--- planner accepts, the executor's first batch finds 3% and falls back, the
--- first segment file of each segment is handed over and the second is
--- scanned without Staged Scan too, six in all. The rows the qual removed
--- are counted as before.
+-- ANALYZE counts every segment file it read: the one handed over and every
+-- later one, scanned without Staged Scan too. The multi-stage estimate check
+-- above falls back on every segment of gp_ord (d % 2 = 0 keeps half the rows
+-- against an estimate of 0.5%); the rows the qual removed are counted as
+-- before. (A single-stage predicate no longer falls back on its hit rate:
+-- the cost re-check found no case where the ordinary scan wins.)
 CREATE FUNCTION gio_fallback(q text) RETURNS text AS $BODY$
 DECLARE line text; fb text := '-'; rm text := '-';
 BEGIN
@@ -301,10 +306,13 @@ BEGIN
     END LOOP;
     RETURN fb || ' / removed ' || rm;
 END $BODY$ LANGUAGE plpgsql;
-SET whpg_staged_scan_min_selectivity = 0.02;
-SELECT gio_fallback('SELECT c FROM gp_adapt WHERE p = 1') AS all_segfiles_fell_back;
-SELECT gio_same('SELECT count(*) || '':'' || sum(a) FROM gp_adapt WHERE p = 1') AS same_after_fallback;
-RESET whpg_staged_scan_min_selectivity;
+SET whpg_staged_scan_density_min_blocks = 1;
+SELECT gio_fallback('SELECT c FROM gp_ord WHERE d % 2 = 0 AND s + 0 = 1') AS all_segfiles_fell_back;
+-- p = 1 keeps 3% of gp_adapt against a planted 0.1%: a single stage, so it
+-- stays staged now, and answers the same
+SELECT gio_fallback('SELECT c FROM gp_adapt WHERE p = 1') AS single_stage_stays;
+SELECT gio_same('SELECT count(*) || '':'' || sum(a) FROM gp_adapt WHERE p = 1') AS same_single_stage;
+RESET whpg_staged_scan_density_min_blocks;
 DROP FUNCTION gio_fallback(text);
 
 -- With true statistics the order is already right and is not touched.

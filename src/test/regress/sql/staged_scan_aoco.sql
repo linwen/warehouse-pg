@@ -344,12 +344,15 @@ SET whpg_enable_staged_scan = on;
 DROP TABLE staged_ramp;
 
 --    The first batch also shows how the survivors spread over Phase A's
---    varblocks. A predicate that keeps a row in nearly every block leaves
---    Phase B nothing to skip, so Phase A falls back to the ordinary scan
---    before emitting a row (once it has crossed enough blocks to tell a
---    dense band from a dense table). 1.8M rows: b = 0 keeps 1% of them, 80
---    per block; the a band keeps as many rows in a handful of blocks (and
---    projects b, so that there is a Phase B at all).
+--    varblocks, and the cost re-check (stagedscan_fallback_cheaper()) weighs
+--    Phase B on them against the ordinary scan. A predicate that keeps a row
+--    in nearly every block leaves Phase B nothing to skip -- yet the scan
+--    stays staged: every block is decompressed either way, and the ordinary
+--    scan would also assemble a tuple and evaluate the predicate for the 99%
+--    of rows Phase B never touches (measured: 12 ms staged, 25 ms ordinary,
+--    25 ms fallen back). 1.8M rows: b = 0 keeps 1% of them, 80 per block;
+--    the a band keeps as many rows in a handful of blocks (and projects b,
+--    so that there is a Phase B at all).
 CREATE TABLE staged_dense(a bigint, b int, c text)
   USING ao_column WITH (compresstype = zstd, compresslevel = 1)
   DISTRIBUTED BY (a);
@@ -360,9 +363,9 @@ SELECT gi_arm('StagedScan_PhaseA_DenseFallback', 'staged_dense'),
        gi_arm('StagedScan_PhaseB_BlockDecompressed', 'staged_dense');
 SELECT count(*) n, sum(a) sa FROM staged_dense WHERE b = 0;
 SELECT gi_hits('StagedScan_PhaseA_DenseFallback') AS segments_fell_back,
-       gi_hits('StagedScan_PhaseB_BlockDecompressed') AS phase_b_blocks;
---    ... and with no Phase B there is no bill: EXPLAIN ANALYZE omits the line.
-SELECT gi_blocks('SELECT count(*) n, sum(a) sa FROM staged_dense WHERE b = 0') AS blocks_line_on_fallback;
+       gi_hits('StagedScan_PhaseB_BlockDecompressed') > 0 AS phase_b_ran;
+--    ... and Phase B decompressed every block, skipping none.
+SELECT gi_blocks('SELECT count(*) n, sum(a) sa FROM staged_dense WHERE b = 0') AS blocks_line_dense;
 SELECT gi_reset('StagedScan_PhaseA_DenseFallback'),
        gi_reset('StagedScan_PhaseB_BlockDecompressed');
 SET whpg_enable_staged_scan = off;
@@ -390,11 +393,16 @@ DROP TABLE staged_dense;
 --    one segment, one segment file each.
 --    staged_null: k IS NULL with a null_frac of 0 in the statistics (taken
 --    before the NULL rows went in) is estimated at one row and keeps 100000
---    of 101000: the first batch falls back.
+--    of 101000: the first batch is evidence, and the cost re-check keeps the
+--    scan staged all the same -- the ordinary scan would read the file over
+--    again and assemble and test every row, where Phase B assembles the
+--    survivors; at 99% the two measure alike (3M rows: 143-151 ms staged,
+--    140-165 ms ordinary), and the re-check falls back only when the ordinary
+--    scan is clearly cheaper.
 --    The same batch arms the multi-stage check of Phase A against the
---    estimate, and the density check, here reached with the gate raised to
---    50% so that a predicate keeping a third of the rows passes the
---    selectivity recheck: staged_den's k = 7 is absent from the statistics.
+--    estimate (null_two_stages), and the cost re-check on staged_den, whose
+--    k = 7 is absent from the statistics and keeps a third of the rows: it
+--    stays staged too.
 --    staged_band: k <= 70000 keeps the first 70000 of 1M rows, the 7% the
 --    statistics predict; the array fills on the band's first blocks, and the
 --    scan stays staged.
@@ -427,12 +435,10 @@ CREATE TABLE staged_den(k int, b int)
 INSERT INTO staged_den SELECT i % 1000 + 10, i FROM generate_series(1, 1000) i;
 ANALYZE staged_den;
 INSERT INTO staged_den SELECT CASE WHEN i % 3 = 0 THEN 7 ELSE 8 END, i FROM generate_series(1, 300000) i;
-SET whpg_staged_scan_min_selectivity = 0.5;
 SELECT gi_arm('StagedScan_PhaseA_DenseFallback', 'staged_den');
 SELECT gi_fallback('SELECT b FROM staged_den WHERE k = 7') AS den_full_batch;
-SELECT gi_hits('StagedScan_PhaseA_DenseFallback') AS dense_fallbacks;
+SELECT gi_hits('StagedScan_PhaseA_DenseFallback') AS cost_fallbacks;
 SELECT gi_reset('StagedScan_PhaseA_DenseFallback');
-RESET whpg_staged_scan_min_selectivity;
 SELECT count(*) n, sum(b) sb FROM staged_den WHERE k = 7;
 SET whpg_enable_staged_scan = off;
 SELECT count(*) n, sum(b) sb FROM staged_den WHERE k = 7;

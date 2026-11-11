@@ -60,10 +60,10 @@ ANALYZE gp_fast;
 
 -- Run q with the feature on, noting whether the fast path tested any block
 -- and whether Phase A completed the segfile or handed it back to the
--- ordinary scan (the dense-survivor check, which the fast path leaves in
--- force: a range over a column whose values cycle every 3000 rows puts a
--- survivor in nearly every block), then off; report whether the answers
--- agree.
+-- ordinary scan (the first-batch cost re-check, which the fast path leaves
+-- in force; a range over a column whose values cycle every 3000 rows puts a
+-- survivor in nearly every block, and the re-check keeps such a scan
+-- staged), then off; report whether the answers agree.
 CREATE FUNCTION gif_probe(q text) RETURNS text AS $BODY$
 DECLARE r_on text; r_off text; fast bigint; segs bigint; dense bigint;
 BEGIN

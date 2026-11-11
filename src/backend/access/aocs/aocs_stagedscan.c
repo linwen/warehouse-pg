@@ -42,20 +42,25 @@
 #include "storage/bufmgr.h"
 #include "utils/datumstream.h"
 #include "utils/faultinjector.h"
+#include "parser/parse_coerce.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/runtimefilter.h"
 
 static void stagedscan_compile_simple(StagedScanState *gi, List *quals,
 									  TupleDesc tupdesc);
 
 /*
- * The first-batch density check (stagedscan_survivors_too_dense()) is only
- * made once Phase A has entered this many of its column's varblocks, and it
- * falls back when Phase B is estimated to cost at least this fraction of the
- * ordinary scan: a gain below 10% is not worth the risk of a loss.
+ * The first-batch fallback checks (stagedscan_fallback_cheaper() for a
+ * single-stage predicate, the estimate check for a multi-stage one) are only
+ * made once Phase A has entered whpg_staged_scan_density_min_blocks of its
+ * column's varblocks (64 by default; a GUC so that the regression tests can
+ * arm the checks on small tables), and never once it has read the segment
+ * file to its end: by then its cost is sunk, and falling back would read
+ * every column of the file again and evaluate the predicate on every row a
+ * second time, where Phase B fetches the survivors' columns once.
  */
-#define STAGED_DENSITY_MIN_BLOCKS	64
-#define STAGED_DENSITY_FALLBACK_RATIO	0.9
 
 /*
  * A multi-stage predicate falls back when the first batch shows Phase A
@@ -258,6 +263,12 @@ stagedscan_flatten_qual(List *qual)
  * feeds an inner scan. Either kind fails at evaluation time with "no value
  * found for parameter", so such quals are declined up front. The planner
  * declines them too; this is the executor's own guard.
+ *
+ * The one Param a stage qual may read is a runtime filter's
+ * (runtimefilter.c): the hash join above the scan sets it, and the scan's
+ * ExprContexts are given the executor's exec-param values for it
+ * (aocsam.c). stagedscan_contains_param() reports every Param,
+ * stagedscan_contains_foreign_param() every other one.
  */
 static bool
 stagedscan_contains_param_walker(Node *node, void *context)
@@ -273,6 +284,26 @@ bool
 stagedscan_contains_param(Node *node)
 {
 	return stagedscan_contains_param_walker(node, NULL);
+}
+
+static bool
+stagedscan_contains_foreign_param_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+		return true;
+	if (runtimefilter_is_clause(node))
+		return stagedscan_contains_foreign_param_walker(runtimefilter_clause_key(node),
+														context);
+	return expression_tree_walker(node, stagedscan_contains_foreign_param_walker,
+								  context);
+}
+
+bool
+stagedscan_contains_foreign_param(Node *node)
+{
+	return stagedscan_contains_foreign_param_walker(node, NULL);
 }
 
 /* Does the expression reference a system column or a whole row? */
@@ -305,6 +336,13 @@ stagedscan_contains_sysattr(Node *node)
  * to fail. Unlike contain_leaked_vars(), a call with no Var below it counts
  * too: whether it fails does not depend on the row, but whether it runs at
  * all does.
+ *
+ * A runtime filter clause (runtimefilter_is_clause(): whpg_rf_match() on an
+ * exec Param of type internal, which only the planner can write -- SQL has
+ * no expression of that type) cannot fail either, although the function is
+ * not leakproof: the executor hands it NULL or a filter it built, and the
+ * planner paired the operator with the key type, so only its key expression
+ * could fail.
  */
 static bool
 stagedscan_can_fail_checker(Oid func_id, void *context)
@@ -318,10 +356,14 @@ stagedscan_can_fail_walker(Node *node, void *context)
 	if (node == NULL)
 		return false;
 
+	if (runtimefilter_is_clause(node))
+		return stagedscan_can_fail_walker(runtimefilter_clause_key(node), context);
+
 	switch (nodeTag(node))
 	{
 		case T_Var:
 		case T_Const:
+		case T_Param:
 		case T_ArrayExpr:
 		case T_BoolExpr:
 		case T_RelabelType:
@@ -784,7 +826,7 @@ stagedscan_build_stages(StagedScanState *gi, AOCSScanDesc scan)
 	 * The fast path tests the datums before consulting the visimap, which is
 	 * only safe because every comparison it admits is leakproof.
 	 */
-	Assert(gi->nsimple == 0 || !gi->phaseAMayFail);
+	Assert((gi->nsimple == 0 && gi->nrfilters == 0) || !gi->phaseAMayFail);
 
 	/*
 	 * The columns the scan's consumers read and no stage fetched are fetched
@@ -1279,7 +1321,7 @@ stagedscan_fall_back(StagedScanState *gi, AOCSScanDesc scan)
  * STAGEDSCAN_BATCH_FIRST_ROWS, doubling afterwards), and never exceeds
  * STAGEDSCAN_BATCH_MAX_ROWS, the array's bound. The first batch of a
  * single-stage predicate is also the evidence for the two fallback checks
- * below, which need Phase A to have crossed STAGED_DENSITY_MIN_BLOCKS blocks
+ * below, which need Phase A to have crossed whpg_staged_scan_density_min_blocks blocks
  * to tell a dense table from a dense band; so that batch keeps filling,
  * whatever its size, until enough blocks have been seen or the array is
  * full. On a sparse predicate those blocks hold few rows and pass in
@@ -1307,51 +1349,106 @@ stagedscan_batch_complete(StagedScanState *gi, AOCSScanDesc scan, bool firstBatc
 	if (gi->surv.nrows < gi->batchTarget)
 		return false;
 	if (firstBatch && (gi->nstages == 1 || gi->phaseASel > 0.0) &&
-		gi->blocksScannedA < STAGED_DENSITY_MIN_BLOCKS)
+		gi->blocksScannedA < whpg_staged_scan_density_min_blocks)
 		return false;
 	return true;
 }
 
 /*
- * Whether the first batch's survivors sit in so many of the anchor column's
- * blocks that Phase B would decompress nearly all of them anyway.
+ * The one data-dependent fallback of a single-stage predicate, decided on
+ * its first batch: would the ordinary scan be clearly cheaper for what is
+ * left of this scan?
  *
- * The same per-column estimate as the planner's staged_fetch_cost() (see
- * stagedscancost.c), evaluated on what Phase A observed instead of on
- * statistics: h = fraction of blocks holding a survivor, s = survivors per
- * such block, rpb = rows per block. Phase B pays h blocks decompressed, about
- * rpb*s/(s+1) datums advanced in each (datumstreamread_find() steps datum by
- * datum) and a per-block walk overhead charged like a decompression; the
- * ordinary scan pays every block and every datum. The anchor column stands
- * in for the columns Phase B will fetch: their rows per block differ with
- * width, the survivors' spread over the row space does not.
+ * Phase A has read a prefix P of the segment file (rowsScannedSeg rows in
+ * blocksScannedA blocks); R is the rest of it. Its cost on P is sunk and
+ * counts for neither side. Staying costs Phase B on P and on R -- the
+ * projected columns walked for the survivors, a tuple formed per survivor
+ * -- and Phase A on R. Falling back costs the ordinary scan of P and R:
+ * every projected column read in full, the prefix over again, and a tuple
+ * formed and the predicate evaluated for every row. The survivors seen so
+ * far stand for the rest of the file, and this file for the scan's
+ * remaining segment files, since a fallback hands the whole scan over.
+ *
+ * The per-column terms are the planner's staged_fetch_cost() on what Phase
+ * A observed: h = fraction of blocks holding a survivor, s = survivors per
+ * such block, rpb = rows per block. Phase B pays h blocks decompressed,
+ * about rpb*s/(s+1) datums advanced in each (datumstreamread_find() steps
+ * datum by datum) and a per-block walk charged like a decompression; the
+ * ordinary scan every block and every datum. Phase B walks the projected
+ * columns other than Phase A's, and that one too when it is projected but
+ * not carried with the survivors (a pass-by-reference type). Those are
+ * summed over the columns each side walks; the per-row costs are then added
+ * once: a tuple per survivor on one side, a tuple and the predicate per row
+ * on the other. Phase A's own predicate on R is paid by both sides as well
+ * -- a fraction of an operator per row on the raw-datum fast path, an
+ * ExecQual() otherwise, the same as the ordinary scan's.
+ *
+ * Falling back is the one choice in this scan that cannot be undone, and
+ * the estimate rests on a prefix, so it takes a margin: the ordinary scan
+ * must come out whpg_staged_scan_fallback_margin cheaper than staying.
  */
 static bool
-stagedscan_survivors_too_dense(StagedScanState *gi)
+stagedscan_fallback_cheaper(StagedScanState *gi, AOCSScanDesc scan, double segRows)
 {
-	double		h;
-	double		s;
-	double		rpb;
 	double		u = cpu_operator_cost;
 	double		dpb = gp_cpu_decompress_cost;
-	double		staged;
-	double		seq;
+	double		t = cpu_tuple_cost;
+	double		pRows = (double) gi->rowsScannedSeg;
+	double		pBlocks = (double) gi->blocksScannedA;
+	double		surv = (double) gi->surv.nrows;
+	double		hit = (double) gi->blocksHitA;
+	double		rRows;
+	double		rpb;
+	double		rBlocks;
+	double		tBlocks;
+	double		tRows;
+	double		d;
+	double		h;
+	double		s;
+	double		survTotal;
+	double		qA;
+	double		qS;
+	double		perColB;
+	double		perColSeq;
+	double		stay;
+	double		fallback;
+	int			nproj = scan->columnScanInfo.num_proj_atts;
+	int			nB;
+	int			nqual = list_length(gi->qual);
+	bool		fastPath = gi->nsimple > 0 || gi->nrfilters > 0;
+	bool		rewalk;
 
-	/*
-	 * No survivor yet, so Phase B has walked nothing. The walk term below is
-	 * charged per block regardless of h, which with about one row per block
-	 * (a very wide Phase A column) would call even an empty batch dense.
-	 */
-	if (gi->blocksHitA == 0)
+	/* no survivor yet: Phase B has nothing to do, falling back could only add */
+	if (pRows <= 0.0 || pBlocks <= 0.0 || hit <= 0.0)
 		return false;
 
-	h = (double) gi->blocksHitA / (double) gi->blocksScannedA;
-	s = (double) gi->surv.nrows / (double) gi->blocksHitA;
-	rpb = (double) gi->rowsScannedSeg / (double) gi->blocksScannedA;
-	staged = h * (dpb + rpb * (s / (s + 1.0)) * u) + dpb;
-	seq = dpb + rpb * u;
+	rpb = pRows / pBlocks;
+	rRows = Max(segRows - pRows, 0.0);
+	rBlocks = rRows / rpb;
+	tBlocks = pBlocks + rBlocks;
+	tRows = pRows + rRows;
+	d = surv / pRows;
+	h = hit / pBlocks;
+	s = surv / hit;
+	survTotal = surv + d * rRows;
 
-	return staged >= STAGED_DENSITY_FALLBACK_RATIO * seq;
+	/* Phase A's column: walked again by Phase B only when projected and not carried */
+	rewalk = gi->carryAttno < 0 && scan->stagedTargetCols != NULL &&
+		scan->stagedTargetCols[gi->phaseAAttnos[0]];
+	nB = Max(nproj - 1, 0) + (rewalk ? 1 : 0);
+
+	qS = nqual * u;
+	qA = fastPath ? u / 4.0 : qS;
+
+	perColB = h * tBlocks * (dpb + rpb * (s / (s + 1.0)) * u) + tBlocks * dpb;
+	perColSeq = tBlocks * dpb + tRows * u;
+
+	stay = nB * perColB + survTotal * t
+		+ rBlocks * dpb + rRows * (u + qA);
+	fallback = nproj * perColSeq + tRows * (t + qS)
+		+ nproj * dpb;			/* the hand-over: streams reopened */
+
+	return fallback * (1.0 + whpg_staged_scan_fallback_margin) < stay;
 }
 
 /*
@@ -1359,6 +1456,25 @@ stagedscan_survivors_too_dense(StagedScanState *gi)
  * symbol in pg_opfamily.dat; integer_ops has INTEGER_BTREE_FAM_OID.
  */
 #define STAGED_DATETIME_BTREE_FAM_OID 434
+
+/*
+ * A runtime filter clause (whpg_rf_match($p, col, hashop, sel)) compiled for
+ * the fast path: the Param the hash join sets, and how to hash the column's
+ * raw value as the join does -- inline for hashint2/4/8 (the hash functions
+ * of the integer and datetime types), through fmgr for anything else. 'cur'
+ * is the filter the Param holds for the block being tested, NULL when there
+ * is none yet (or it was dropped), which lets every row through; 'probe'
+ * carries the same switch-off whpg_rf_match() applies.
+ */
+typedef struct StagedScanSimpleFilter
+{
+	int			paramid;
+	Oid			collation;
+	bool		inlineHash;
+	FmgrInfo	hashfn;
+	RuntimeFilter *cur;
+	RuntimeFilterProbe probe;
+} StagedScanSimpleFilter;
 
 /*
  * Compile Phase A's clauses into the fast-path form, if they qualify: one
@@ -1378,10 +1494,13 @@ stagedscan_compile_simple(StagedScanState *gi, List *quals, TupleDesc tupdesc)
 	Oid			famoid;
 	bool		integerFamily;
 	StagedScanSimpleClause *simple;
+	StagedScanSimpleFilter *rf;
 	int			n = 0;
+	int			nrf = 0;
 	ListCell   *lc;
 
 	gi->nsimple = 0;
+	gi->nrfilters = 0;
 	if (gi->nphaseA != 1 || quals == NIL)
 		return;
 
@@ -1411,6 +1530,8 @@ stagedscan_compile_simple(StagedScanState *gi, List *quals, TupleDesc tupdesc)
 
 	simple = (StagedScanSimpleClause *)
 		palloc(sizeof(StagedScanSimpleClause) * list_length(quals));
+	rf = (StagedScanSimpleFilter *)
+		palloc0(sizeof(StagedScanSimpleFilter) * list_length(quals));
 
 	foreach(lc, quals)
 	{
@@ -1423,6 +1544,48 @@ stagedscan_compile_simple(StagedScanState *gi, List *quals, TupleDesc tupdesc)
 		bool		flipped;
 		int			strategy;
 		int64		value;
+
+		/*
+		 * A runtime filter on this column: the same checks whpg_rf_match()
+		 * makes on its arguments, made once here, so that the block loop can
+		 * hash the raw value and probe the filter directly.
+		 */
+		if (runtimefilter_is_clause(clause))
+		{
+			FuncExpr   *fe = (FuncExpr *) clause;
+			Node	   *key = (Node *) lsecond(fe->args);
+			Node	   *opc = (Node *) lthird(fe->args);
+			Oid			opno;
+			Oid			lhsproc;
+			Oid			rhsproc;
+			Oid			lefttype;
+			Oid			righttype;
+
+			if (!IsA(key, Var) ||
+				((Var *) key)->varattno != attno + 1 ||
+				((Var *) key)->varlevelsup != 0 ||
+				((Var *) key)->vartype != att->atttypid)
+				return;
+			if (!IsA(opc, Const) || ((Const *) opc)->constisnull)
+				return;
+			opno = DatumGetObjectId(((Const *) opc)->constvalue);
+			if (!op_hashjoinable(opno, att->atttypid) ||
+				!get_op_hash_functions(opno, &lhsproc, &rhsproc))
+				return;
+			op_input_types(opno, &lefttype, &righttype);
+			if (!IsBinaryCoercible(att->atttypid, lefttype))
+				return;
+
+			rf[nrf].paramid = ((Param *) linitial(fe->args))->paramid;
+			rf[nrf].collation = fe->inputcollid;
+			rf[nrf].inlineHash = (att->attlen == 8 && lhsproc == F_HASHINT8) ||
+				(att->attlen == 4 && lhsproc == F_HASHINT4) ||
+				(att->attlen == 2 && lhsproc == F_HASHINT2);
+			if (!rf[nrf].inlineHash)
+				fmgr_info_cxt(lhsproc, &rf[nrf].hashfn, CurrentMemoryContext);
+			nrf++;
+			continue;
+		}
 
 		if (!IsA(clause, OpExpr))
 			return;
@@ -1512,6 +1675,8 @@ stagedscan_compile_simple(StagedScanState *gi, List *quals, TupleDesc tupdesc)
 
 	gi->simple = simple;
 	gi->nsimple = n;
+	gi->rfilters = rf;
+	gi->nrfilters = nrf;
 	gi->simpleLen = att->attlen;
 }
 
@@ -1525,7 +1690,7 @@ stagedscan_block_is_fast(StagedScanState *gi, DatumStreamRead *ds)
 {
 	DatumStreamBlockRead *dsr = &ds->blockRead;
 
-	return gi->nsimple > 0 &&
+	return (gi->nsimple > 0 || gi->nrfilters > 0) &&
 		dsr->datumStreamVersion == DatumStreamVersion_Original &&
 		!dsr->has_null &&
 		dsr->typeInfo.datumlen == gi->simpleLen &&
@@ -1558,6 +1723,61 @@ stagedscan_simple_match(const StagedScanSimpleClause *simple, int nsimple, int64
 				ok = v > c;
 				break;
 		}
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Point each compiled runtime filter clause at the filter its Param holds
+ * now, for the block about to be tested. The hash join sets the Param before
+ * it reads a probe row and only changes it on a rebuild, so once per block is
+ * often enough; a NULL Param (no filter yet, or dropped) lets every row
+ * through, as whpg_rf_match() does.
+ */
+static inline void
+stagedscan_rf_bind(StagedScanState *gi)
+{
+	ParamExecData *vals = gi->econtext ? gi->econtext->ecxt_param_exec_vals : NULL;
+
+	for (int k = 0; k < gi->nrfilters; k++)
+	{
+		StagedScanSimpleFilter *rf = &gi->rfilters[k];
+		ParamExecData *prm = vals ? &vals[rf->paramid] : NULL;
+
+		if (prm == NULL || prm->isnull)
+			rf->cur = NULL;
+		else
+		{
+			rf->cur = (RuntimeFilter *)
+				runtimefilter_check((struct varlena *) DatumGetPointer(prm->value));
+			runtimefilter_probe_set(&rf->probe, rf->cur);
+		}
+	}
+}
+
+/* Does the raw value pass every runtime filter clause on the Phase A column? */
+static inline bool
+stagedscan_rf_match(StagedScanState *gi, int64 v, int len)
+{
+	for (int k = 0; k < gi->nrfilters; k++)
+	{
+		StagedScanSimpleFilter *rf = &gi->rfilters[k];
+		uint32		hv;
+		bool		ok;
+
+		if (rf->cur == NULL || rf->probe.disabled)
+			continue;
+		if (rf->inlineHash)
+			hv = runtimefilter_hash_int(v, len);
+		else
+			hv = DatumGetUInt32(FunctionCall1Coll(&rf->hashfn, rf->collation,
+												  len == 8 ? Int64GetDatum(v) :
+												  len == 4 ? Int32GetDatum((int32) v) :
+												  Int16GetDatum((int16) v)));
+		ok = runtimefilter_contains(rf->cur, hv);
+		runtimefilter_probe_count(&rf->probe, ok);
 		if (!ok)
 			return false;
 	}
@@ -1599,6 +1819,7 @@ stagedscan_phase_a_scan_block(StagedScanState *gi, AOCSScanDesc scan,
 	const int64 first = ds->blockFirstRowNum;
 	const StagedScanSimpleClause *simple = gi->simple;
 	const int	nsimple = gi->nsimple;
+	const int	nrf = gi->nrfilters;
 	int			i;
 
 	if (first != gi->curBlockFirstRow)
@@ -1608,6 +1829,8 @@ stagedscan_phase_a_scan_block(StagedScanState *gi, AOCSScanDesc scan,
 		gi->blocksScannedA++;
 	}
 	gi->blocksFastA++;
+	if (nrf > 0)
+		stagedscan_rf_bind(gi);
 
 #ifdef FAULT_INJECTOR
 	FaultInjector_InjectFaultIfSet("StagedScan_PhaseA_FastBlock",
@@ -1646,6 +1869,8 @@ stagedscan_phase_a_scan_block(StagedScanState *gi, AOCSScanDesc scan,
 		gi->rowsScannedSeg++;
 
 		if (!stagedscan_simple_match(simple, nsimple, v))
+			continue;
+		if (nrf > 0 && !stagedscan_rf_match(gi, v, len))
 			continue;
 
 		rowNum = first + i;
@@ -1718,8 +1943,8 @@ stagedscan_phase_a_scan_block(StagedScanState *gi, AOCSScanDesc scan,
  * Returns false if Staged Scan must fall back to a normal scan for this
  * query. That can only happen before the first batch is handed over -- a
  * Phase A column has missing values in this segment, or, for a single-stage
- * predicate, the first batch shows the predicate keeping more than
- * whpg_staged_scan_min_selectivity of the rows it scanned, or, for a
+ * predicate, the first batch shows the ordinary scan clearly cheaper for
+ * the rest of the scan (stagedscan_fallback_cheaper()), or, for a
  * multi-stage predicate, Phase A keeping several times what the planner
  * estimated -- because the fallback hands the segment to aocs_getnext() as
  * if nothing had been read, which is only true while no row has been
@@ -1964,11 +2189,18 @@ stagedscan_run_phase_a(StagedScanState *gi, AOCSScanDesc scan,
 	MemoryContextSwitchTo(oldctx);
 
 	/*
-	 * The first batch normally keeps filling until STAGED_DENSITY_MIN_BLOCKS
+	 * The first batch normally keeps filling until whpg_staged_scan_density_min_blocks
 	 * blocks have passed (stagedscan_batch_complete()), but the array bound
 	 * STAGEDSCAN_BATCH_MAX_ROWS can close it sooner; a handful of rows from
-	 * the first few blocks is no evidence to fall back on, unless they are
-	 * the whole segment file.
+	 * the first few blocks is no evidence to fall back on. Nor is the whole
+	 * segment file: once Phase A has read it to the end its cost is sunk,
+	 * and falling back would read every column of the file again and
+	 * evaluate the predicate on every row a second time, where Phase B
+	 * fetches the survivors' columns once -- a loss at any density. (TPC-DS
+	 * q89: 111 partition scans of some 16 blocks each, 11% survivors, fell
+	 * back on every one and ran a third slower than staying staged.) A
+	 * segment file too short to cross whpg_staged_scan_density_min_blocks
+	 * blocks is scanned staged whatever its first batch shows.
 	 *
 	 * A full array is no handful, but the rate over those few blocks cannot
 	 * tell a clustered band at the start of the file (older data in a table
@@ -1985,28 +2217,32 @@ stagedscan_run_phase_a(StagedScanState *gi, AOCSScanDesc scan,
 		gi->phaseASel > 0.0 &&
 		(double) gi->surv.nrows >
 		STAGED_ESTIMATE_SLACK * gi->phaseASel * (double) segRows;
-	enoughEvidence = gi->phaseAEof ||
-		gi->blocksScannedA >= STAGED_DENSITY_MIN_BLOCKS ||
-		fullBatchEvidence;
+	enoughEvidence = !gi->phaseAEof &&
+		(gi->blocksScannedA >= whpg_staged_scan_density_min_blocks ||
+		 fullBatchEvidence);
 
 	/*
-	 * Staged Scan is only worth it when the predicate discards most of the
-	 * rows. For a single-stage predicate the planner's selectivity gate is
-	 * re-checked here on the first batch, before any row has been emitted:
-	 * if the rows scanned so far kept more than
-	 * whpg_staged_scan_min_selectivity of themselves, the statistics the
-	 * planner trusted were wrong and the ordinary scan is the better deal.
-	 * With more than one stage the gate applies to the whole predicate,
-	 * which the planner has already checked; Phase A alone may legitimately
-	 * keep far more for the later stages to whittle down. Later batches
-	 * never fall back: rows have been emitted, and the scan stays correct
-	 * either way, only less profitable.
+	 * The one data-dependent fallback of a single-stage predicate, decided on
+	 * its first batch and only then: is the ordinary scan clearly cheaper for
+	 * what is left of the scan (stagedscan_fallback_cheaper())? The survivors
+	 * of the blocks crossed so far are the evidence; the planner's gate is not
+	 * re-applied, since a predicate keeping a fifth of the rows still runs a
+	 * third faster staged when the rows it drops need not be assembled. With
+	 * more than one stage Phase A alone may legitimately keep far more for the
+	 * later stages to whittle down, and the check below applies instead. Later
+	 * batches never fall back: rows have been emitted, and the scan stays
+	 * correct either way, only less profitable.
 	 */
-	if (firstBatch && gi->nstages == 1 && gi->rowsScannedSeg > 0 &&
-		enoughEvidence &&
-		(double) gi->surv.nrows >
-		(double) gi->rowsScannedSeg * whpg_staged_scan_min_selectivity)
+	if (firstBatch && gi->nstages == 1 && enoughEvidence &&
+		stagedscan_fallback_cheaper(gi, scan, (double) segRows))
+	{
+#ifdef FAULT_INJECTOR
+		FaultInjector_InjectFaultIfSet("StagedScan_PhaseA_DenseFallback",
+									   DDLNotSpecified, "",
+									   RelationGetRelationName(scan->rs_base.rs_rd));
+#endif
 		return stagedscan_fall_back(gi, scan);
+	}
 
 	/*
 	 * For a multi-stage predicate Phase A may legitimately keep far more than
@@ -2014,7 +2250,7 @@ stagedscan_run_phase_a(StagedScanState *gi, AOCSScanDesc scan,
 	 * stage order and the whole decision rest on that estimate, and a clause
 	 * on an expression the statistics know nothing about is estimated at
 	 * 0.5% whether it keeps 0.5% or 50%. The first batch keeps filling until
-	 * STAGED_DENSITY_MIN_BLOCKS blocks have passed when this check is armed,
+	 * whpg_staged_scan_density_min_blocks blocks have passed when this check is armed,
 	 * so a band at the start of the file does not look like a dense table.
 	 * Fall back when the observed rate is both several times the estimate
 	 * and well above the gate; smaller misses are the later stages' and the
@@ -2035,29 +2271,6 @@ stagedscan_run_phase_a(StagedScanState *gi, AOCSScanDesc scan,
 #endif
 			return stagedscan_fall_back(gi, scan);
 		}
-	}
-
-	/*
-	 * The other first-batch, single-stage check: are the survivors clustered
-	 * enough for Phase B to skip anything? The planner may have accepted this
-	 * scan on the hope that they are (its correlation statistic cannot see a
-	 * table loaded in parallel, whose interleaved ascending runs are clustered
-	 * in blocks but not in correlation); the batch is the evidence. Judged
-	 * only once Phase A has crossed enough blocks: a batch that fills within
-	 * a few blocks is a clustered band, dense inside itself and empty around
-	 * it, which is exactly the shape Staged Scan is for -- unless it holds
-	 * far more than the statistics allow the whole file (fullBatchEvidence).
-	 */
-	if (firstBatch && gi->nstages == 1 &&
-		(gi->blocksScannedA >= STAGED_DENSITY_MIN_BLOCKS || fullBatchEvidence) &&
-		stagedscan_survivors_too_dense(gi))
-	{
-#ifdef FAULT_INJECTOR
-		FaultInjector_InjectFaultIfSet("StagedScan_PhaseA_DenseFallback",
-									   DDLNotSpecified, "",
-									   RelationGetRelationName(scan->rs_base.rs_rd));
-#endif
-		return stagedscan_fall_back(gi, scan);
 	}
 
 	gi->phaseABatches++;
@@ -2160,7 +2373,7 @@ stagedscan_applicable(Relation rel, List *targetlist, List *qual,
 	 */
 	if (contain_volatile_functions((Node *) qual) ||
 		contain_subplans((Node *) qual) ||
-		stagedscan_contains_param((Node *) qual))
+		stagedscan_contains_foreign_param((Node *) qual))
 		return false;
 
 	/* System columns and whole-row references live in no column file. */

@@ -1,0 +1,403 @@
+-- Runtime filters for hash joins.
+--
+-- Once a hash join has built its hash table, it hands the probe side's scan a
+-- Bloom filter over the join keys (an exec Param read by a whpg_rf_match()
+-- clause the planner put in the scan's qual), and the scan drops the rows that
+-- cannot have a match before it assembles them. On an AOCO table the clause
+-- leads a Staged Scan, so those rows' other columns are never decompressed.
+-- Only joins whose probe side is a scan in the same slice get one: no Motion
+-- in between, and only join types that drop unmatched probe rows.
+--
+-- Part 1 is the Postgres planner, Part 2 GPORCA. Two helpers keep the matrix
+-- legible: rf_planned(q) says whether EXPLAIN shows a Runtime Filter line,
+-- rf_same(q) whether q (yielding one text value) answers the same with the
+-- feature on and off.
+
+CREATE SCHEMA runtime_filter;
+SET search_path = runtime_filter;
+
+CREATE FUNCTION rf_planned(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+	found bool := false;
+BEGIN
+	FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF l LIKE '%Runtime Filter:%' THEN
+			found := true;
+		END IF;
+	END LOOP;
+	RETURN found;
+END $$;
+
+CREATE FUNCTION rf_same(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE
+	a text;
+	b text;
+BEGIN
+	SET LOCAL whpg_enable_runtime_filter = on;
+	EXECUTE q INTO a;
+	SET LOCAL whpg_enable_runtime_filter = off;
+	EXECUTE q INTO b;
+	RETURN a IS NOT NULL AND a = b;
+END $$;
+
+-- The dimension: 5000 keys, a flag that keeps 2% of them, a bigint copy of
+-- the key and a text one for cross-type and text joins.
+CREATE TABLE rf_dim(k int, flag int, kb bigint, name text) DISTRIBUTED BY (k);
+INSERT INTO rf_dim SELECT i, i % 50, i, 'name_' || i FROM generate_series(1, 5000) i;
+
+-- The fact tables: 200000 rows, keys over 1..6000 so that some never match,
+-- one key in a thousand NULL; one table per access method.
+CREATE TABLE rf_fact_heap(id int, k int, amt int, tag text, pad text) DISTRIBUTED BY (id);
+INSERT INTO rf_fact_heap
+	SELECT i,
+		   CASE WHEN i % 997 = 0 THEN NULL ELSE (i * 7919) % 6000 + 1 END,
+		   i % 1000,
+		   'name_' || ((i * 7919) % 6000 + 1),
+		   repeat('x', 20)
+	  FROM generate_series(1, 200000) i;
+CREATE TABLE rf_fact_ao(LIKE rf_fact_heap) USING ao_row DISTRIBUTED BY (id);
+CREATE TABLE rf_fact_aoco(LIKE rf_fact_heap)
+	USING ao_column WITH (compresstype = zstd, compresslevel = 1) DISTRIBUTED BY (id);
+INSERT INTO rf_fact_ao SELECT * FROM rf_fact_heap;
+INSERT INTO rf_fact_aoco SELECT * FROM rf_fact_heap;
+ANALYZE rf_dim;
+ANALYZE rf_fact_heap;
+ANALYZE rf_fact_ao;
+ANALYZE rf_fact_aoco;
+
+-- the tables are small; let a probe of a few thousand rows qualify
+SET whpg_runtime_filter_min_probe_rows = 1000;
+
+----------------------------------------------------------------------
+-- Part 1: the Postgres planner
+----------------------------------------------------------------------
+SET optimizer = off;
+
+-- An AOCO fact: the filter clause leads a Staged Scan on the join key.
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(f.amt) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+SELECT count(*), sum(f.amt) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$);
+
+-- Heap and AO row: the clause runs as an ordinary qual.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_heap f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_heap f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$);
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_ao f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_ao f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$);
+
+-- A predicate of the fact's own as well. The scan keeps its own staged read
+-- of amt and the filter is left out: the Staged Scan model takes a
+-- two-column predicate at its pessimistic estimate (see the star join
+-- below). amt < 50 keeps 5% of the rows; 10% would sit on the model's
+-- threshold and flip with the sample ANALYZE takes.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3 AND f.amt < 50;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3 AND f.amt < 50$$);
+
+-- The fact's columns in the output: the filter column is not among them.
+SELECT rf_same($$SELECT md5(string_agg(f.id::text || f.amt::text || f.pad, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$);
+
+-- Join types: only those that drop unmatched probe rows.
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$) AS inner_join;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f LEFT JOIN rf_dim d ON f.k = d.k AND d.flag = 3$$) AS left_join;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f WHERE EXISTS (SELECT 1 FROM rf_dim d WHERE d.k = f.k AND d.flag = 3)$$) AS semi_join;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f WHERE NOT EXISTS (SELECT 1 FROM rf_dim d WHERE d.k = f.k AND d.flag = 3)$$) AS anti_join;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f WHERE f.k NOT IN (SELECT d.k FROM rf_dim d WHERE d.flag = 3)$$) AS not_in;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f LEFT JOIN rf_dim d ON f.k = d.k AND d.flag = 3$$) AS left_join;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f WHERE EXISTS (SELECT 1 FROM rf_dim d WHERE d.k = f.k AND d.flag = 3)$$) AS semi_join;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f WHERE NOT EXISTS (SELECT 1 FROM rf_dim d WHERE d.k = f.k AND d.flag = 3)$$) AS anti_join;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f WHERE f.k NOT IN (SELECT d.k FROM rf_dim d WHERE d.flag = 3)$$) AS not_in;
+
+-- Cross-type (int4 = int8) and text keys: the probe hashes with its own
+-- type's function, which the hash opfamily keeps consistent with the inner's.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.kb WHERE d.flag = 3;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.kb WHERE d.flag = 3$$);
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.tag = d.name WHERE d.flag = 3;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.tag = d.name WHERE d.flag = 3$$);
+
+-- A probe under a Motion gets no filter: both sides large, the fact is
+-- redistributed to the other table's key.
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_fact_heap g ON f.k = g.id$$) AS probe_under_motion;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_fact_heap g ON f.k = g.id$$) AS probe_under_motion;
+
+-- Too many probe rows would match: no filter.
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k$$) AS unselective;
+
+-- A filter that turns out useless is switched off as the scan runs: the
+-- selectivity gate is lifted so that one is planned although five probe rows
+-- in six have a match, and the switch-off ratio lowered so that the scan
+-- gives the filter up after its first 65536 rows. The answer is the same.
+SET whpg_runtime_filter_max_selectivity = 1.0;
+SET whpg_runtime_filter_disable_ratio = 0.5;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_heap f JOIN rf_dim d ON f.k = d.k$$) AS forced;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_heap f JOIN rf_dim d ON f.k = d.k$$) AS useless_filter_heap;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k$$) AS useless_filter_aoco;
+RESET whpg_runtime_filter_disable_ratio;
+RESET whpg_runtime_filter_max_selectivity;
+
+-- The switch.
+SET whpg_enable_runtime_filter = off;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+RESET whpg_enable_runtime_filter;
+
+-- Statistics far off on the build side: planned on 10 rows, the filter gets
+-- 200000 keys at run time, far too many for the 64 kB allowed, and is
+-- dropped; the join still answers right.
+CREATE TABLE rf_stale(k int) DISTRIBUTED BY (k);
+INSERT INTO rf_stale SELECT i FROM generate_series(1, 10) i;
+ANALYZE rf_stale;
+INSERT INTO rf_stale SELECT i FROM generate_series(11, 200000) i;
+SET whpg_runtime_filter_max_size = 64;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k$$) AS planned_on_stale_stats;
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k$$);
+RESET whpg_runtime_filter_max_size;
+
+-- Rescans: the hash join rebuilt for every outer row of a nested loop, its
+-- filter with it.
+SELECT rf_same($$SELECT md5(string_agg(x::text || ':' || c::text, ',' ORDER BY x)) FROM (VALUES (1), (2), (3)) v(x), LATERAL (SELECT count(*) c FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = v.x) q$$) AS rescan;
+SELECT x, c FROM (VALUES (1), (2), (3)) v(x), LATERAL (SELECT count(*) c FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = v.x) q ORDER BY x;
+
+-- A cursor fetched in pieces: the filter is in place before the first row.
+BEGIN;
+DECLARE rf_cur CURSOR FOR SELECT f.id FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3 ORDER BY f.id;
+FETCH 3 FROM rf_cur;
+FETCH 3 FROM rf_cur;
+CLOSE rf_cur;
+COMMIT;
+
+-- The probe function cannot be called from SQL: its filter argument is of
+-- type internal, which no SQL expression yields, so the parser never
+-- resolves it -- neither with a literal nor with a scalar subquery, whose
+-- Param is of a SQL type. The clause can only come from the planner, and a
+-- Staged Scan may trust its Param to hold a filter a hash join built.
+SELECT whpg_rf_match(NULL::bytea, 1, '=(integer,integer)'::regoperator::oid, 0.5);
+SELECT count(*) FROM rf_fact_aoco f WHERE f.amt < 100 AND whpg_rf_match((SELECT '\x00'::bytea), f.k, '=(integer,integer)'::regoperator::oid, 0.000001);
+SELECT proname, proargtypes::regtype[] FROM pg_proc WHERE proname = 'whpg_rf_match';
+
+-- A hash join over a non-strict hash operator matches NULL keys (it hashes
+-- them as 0, ExecHashGetHashValue()), which the filter would reject: such a
+-- join gets no filter. The operator is IS NOT DISTINCT FROM in disguise, in
+-- plpgsql so that the planner cannot inline it back into one; nested loops
+-- are off so that the hash join is chosen. 200 fact rows have a NULL key.
+CREATE FUNCTION rf_nseq(int, int) RETURNS bool LANGUAGE plpgsql IMMUTABLE CALLED ON NULL INPUT AS
+$$ BEGIN RETURN $1 IS NOT DISTINCT FROM $2; END $$;
+CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = rf_nseq, COMMUTATOR = ===, HASHES, RESTRICT = eqsel, JOIN = eqjoinsel);
+CREATE OPERATOR FAMILY rf_nsfam USING hash;
+CREATE OPERATOR CLASS rf_nsop FOR TYPE int USING hash FAMILY rf_nsfam AS OPERATOR 1 ===, FUNCTION 1 hashint4(int);
+CREATE TABLE rf_dim_null(k int) DISTRIBUTED RANDOMLY;
+INSERT INTO rf_dim_null VALUES (NULL), (17);
+ANALYZE rf_dim_null;
+SET enable_nestloop = off;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_heap f JOIN rf_dim_null d ON f.k === d.k;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_heap f JOIN rf_dim_null d ON f.k === d.k$$) AS non_strict_operator;
+SELECT count(*) FILTER (WHERE f.k IS NULL) AS null_matches, count(*) FILTER (WHERE f.k = 17) AS key_matches
+  FROM rf_fact_heap f JOIN rf_dim_null d ON f.k === d.k;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_heap f JOIN rf_dim_null d ON f.k = d.k$$) AS strict_operator;
+RESET enable_nestloop;
+
+-- The Staged Scan's fast path. A NULL-free block of the join key column in
+-- the original datum layout is tested on its raw datum array: each value is
+-- hashed and looked up in the filter directly, no tuple formed, no
+-- ExecQual(); the fault point StagedScan_PhaseA_FastBlock fires once per
+-- block so tested. The keys the dimension holds are clustered so that Phase
+-- A finds its survivors in a few blocks and runs to the end of the file. The
+-- fault functions live outside this schema.
+SET search_path = runtime_filter, public;
+CREATE TABLE rf_fast(k int, k8 bigint, dt date, pay text)
+	USING ao_column WITH (compresstype = zstd, compresslevel = 1) DISTRIBUTED BY (k);
+INSERT INTO rf_fast
+	SELECT i, i, date '2020-01-01' + i, 'p' || i FROM generate_series(1, 400000) i;
+CREATE TABLE rf_fast_dim(k int, k8 bigint, dt date) DISTRIBUTED BY (k);
+INSERT INTO rf_fast_dim SELECT i, i, date '2020-01-01' + i FROM generate_series(1, 4000) i;
+ANALYZE rf_fast;
+ANALYZE rf_fast_dim;
+CREATE FUNCTION rf_fast_blocks(q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+	hits bigint;
+BEGIN
+	PERFORM gp_inject_fault('StagedScan_PhaseA_FastBlock', 'skip', '', '', 'rf_fast', 1, -1, 0, dbid)
+	   FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	EXECUTE q;
+	SELECT sum(substring(gp_inject_fault('StagedScan_PhaseA_FastBlock', 'status', dbid)
+						 from 'num times hit:''(\d+)''')::bigint)
+	  INTO hits
+	  FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	PERFORM gp_inject_fault('StagedScan_PhaseA_FastBlock', 'reset', dbid)
+	   FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	RETURN hits;
+END $$;
+EXPLAIN (COSTS OFF)
+SELECT count(f.pay) FROM rf_fast f JOIN rf_fast_dim d ON f.k = d.k;
+-- an int4 key, hashed inline; the same join without a filter stages nothing
+SELECT rf_fast_blocks($$SELECT count(f.pay) FROM rf_fast f JOIN rf_fast_dim d ON f.k = d.k$$) > 0 AS fast_int4;
+SELECT rf_same($$SELECT md5(string_agg(f.k::text, ',' ORDER BY f.k)) FROM rf_fast f JOIN rf_fast_dim d ON f.k = d.k$$) AS fast_int4;
+SET whpg_enable_runtime_filter = off;
+SELECT rf_fast_blocks($$SELECT count(f.pay) FROM rf_fast f JOIN rf_fast_dim d ON f.k = d.k$$) AS no_filter_no_fast_blocks;
+RESET whpg_enable_runtime_filter;
+-- an int8 key, hashed inline
+SELECT rf_fast_blocks($$SELECT count(f.pay) FROM rf_fast f JOIN rf_fast_dim d ON f.k8 = d.k8$$) > 0 AS fast_int8;
+SELECT rf_same($$SELECT md5(string_agg(f.k::text, ',' ORDER BY f.k)) FROM rf_fast f JOIN rf_fast_dim d ON f.k8 = d.k8$$) AS fast_int8;
+-- a date key, hashed through the operator's hash function
+SELECT rf_fast_blocks($$SELECT count(f.pay) FROM rf_fast f JOIN rf_fast_dim d ON f.dt = d.dt$$) > 0 AS fast_date;
+SELECT rf_same($$SELECT md5(string_agg(f.k::text, ',' ORDER BY f.k)) FROM rf_fast f JOIN rf_fast_dim d ON f.dt = d.dt$$) AS fast_date;
+-- a clause of the scan's own on the key column beside the filter: both on
+-- the fast path
+SELECT rf_fast_blocks($$SELECT count(f.pay) FROM rf_fast f JOIN rf_fast_dim d ON f.k = d.k WHERE f.k < 3000$$) > 0 AS fast_with_range;
+SELECT rf_same($$SELECT md5(string_agg(f.k::text, ',' ORDER BY f.k)) FROM rf_fast f JOIN rf_fast_dim d ON f.k = d.k WHERE f.k < 3000$$) AS fast_with_range;
+SET search_path = runtime_filter;
+
+-- A star join: the fact joined to two dimensions, each selective, is a
+-- chain of hash joins over one scan. The upper join's key is a column of the
+-- fact too, so its filter is tested at the scan as well: two Runtime Filter
+-- lines on the heap fact, the more selective one first. On the AOCO fact the
+-- first filter leads a Staged Scan, and a second filter column would cost it
+-- that (the Staged Scan model takes a multi-column predicate at its
+-- pessimistic estimate), so the second filter is left out and the scan
+-- keeps its staged read of the first key. Through a LEFT join (fact outer)
+-- the upper filter still reaches the scan, while the LEFT join itself gets
+-- none; a key taken from a lower join's inner side gets none.
+CREATE FUNCTION rf_filters(q text) RETURNS int LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+	n int := 0;
+BEGIN
+	FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF l LIKE '%Runtime Filter:%' THEN
+			n := n + 1;
+		END IF;
+	END LOOP;
+	RETURN n;
+END $$;
+CREATE TABLE rf_dim_amt(amt int, flag int) DISTRIBUTED REPLICATED;
+INSERT INTO rf_dim_amt SELECT i, i % 20 FROM generate_series(0, 999) i;
+ANALYZE rf_dim_amt;
+-- (k and amt are both derived from the row number, so only amt values 8 and
+-- 18 modulo 20 occur among the rows whose k has flag 3: flag 8 keeps half
+-- of them, flags 0-7 none)
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_heap f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8;
+SELECT count(*) FROM rf_fact_heap f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8;
+SELECT rf_filters($$SELECT count(*) FROM rf_fact_heap f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8$$) AS star_two_filters_heap;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_heap f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8$$) AS star_two_filters_heap;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8;
+SELECT rf_filters($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8$$) AS star_keeps_staged_scan;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8$$) AS star_keeps_staged_scan;
+SELECT rf_filters($$SELECT count(*) FROM rf_fact_aoco f LEFT JOIN rf_dim d ON f.k = d.k AND d.flag = 3 JOIN rf_dim_amt a ON f.amt = a.amt WHERE a.flag = 1$$) AS through_left_join;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text || coalesce(d.k::text, 'x'), ',' ORDER BY f.id)) FROM rf_fact_aoco f LEFT JOIN rf_dim d ON f.k = d.k AND d.flag = 3 JOIN rf_dim_amt a ON f.amt = a.amt WHERE a.flag = 1$$) AS through_left_join;
+SELECT rf_filters($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON d.flag = a.amt WHERE d.flag < 3 AND a.flag = 1$$) AS key_from_inner_side;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON d.flag = a.amt WHERE d.flag < 3 AND a.flag = 1$$) AS key_from_inner_side;
+
+-- A join on several keys takes a filter over one of them: the key whose
+-- values the inner side covers the smallest share of, by the statistics (the
+-- inner side's distinct values of the key over the probe column's). rf_dim_mk
+-- has every k of the fact, so a filter over k would pass every row, and 20 of
+-- the fact's 1000 amt values, so the filter is over amt -- on whichever side
+-- of the AND it stands. rf_dim_mk_k is the other way round: 60 k values
+-- (every hundredth) with 100 amt values each, so its filter is over k, a
+-- column with NULLs on both sides, which the filter rejects as the join does.
+CREATE TABLE rf_dim_mk(k int, amt int) DISTRIBUTED REPLICATED;
+INSERT INTO rf_dim_mk
+	SELECT i, CASE WHEN i % 300 = 0 THEN NULL ELSE (i % 20) * 50 END
+	  FROM generate_series(1, 6000) i;
+CREATE TABLE rf_dim_mk_k(k int, amt int) DISTRIBUTED REPLICATED;
+INSERT INTO rf_dim_mk_k
+	SELECT j * 100 + 1, a FROM generate_series(0, 59) j CROSS JOIN generate_series(0, 99) a
+	UNION ALL SELECT NULL, i FROM generate_series(0, 9) i;
+ANALYZE rf_dim_mk;
+ANALYZE rf_dim_mk_k;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_heap f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt;
+SELECT count(*) FROM rf_fact_heap f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_heap f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt$$) AS two_keys_second_chosen;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim_mk d ON f.amt = d.amt AND f.k = d.k;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim_mk d ON f.amt = d.amt AND f.k = d.k$$) AS two_keys_first_chosen;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim_mk_k d ON f.amt = d.amt AND f.k = d.k;
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim_mk_k d ON f.amt = d.amt AND f.k = d.k;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim_mk_k d ON f.amt = d.amt AND f.k = d.k$$) AS two_keys_nulls;
+
+-- Why a join got no filter: EXPLAIN says, when asked. The last two are joins
+-- on two keys: one where neither key alone would drop enough rows (rf_dim's
+-- k and name cover 5000 of the fact's 6000), one whose probe has no
+-- statistics to choose a key by.
+SET gp_autostats_mode = none;
+CREATE TABLE rf_fact_nostats(LIKE rf_fact_heap) DISTRIBUTED BY (id);
+INSERT INTO rf_fact_nostats SELECT * FROM rf_fact_heap;
+RESET gp_autostats_mode;
+SET whpg_runtime_filter_explain = on;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f LEFT JOIN rf_dim d ON f.k = d.k AND d.flag = 3;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_fact_heap g ON f.k = g.id;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k AND f.tag = d.name;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_nostats f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt;
+RESET whpg_runtime_filter_explain;
+
+----------------------------------------------------------------------
+-- Part 2: GPORCA
+----------------------------------------------------------------------
+SET optimizer = on;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(f.amt) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+SELECT count(*), sum(f.amt) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$);
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_heap f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_heap f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$);
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_ao f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$);
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3 AND f.amt < 50$$);
+
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f LEFT JOIN rf_dim d ON f.k = d.k AND d.flag = 3$$) AS left_join;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f WHERE EXISTS (SELECT 1 FROM rf_dim d WHERE d.k = f.k AND d.flag = 3)$$) AS semi_join;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f WHERE NOT EXISTS (SELECT 1 FROM rf_dim d WHERE d.k = f.k AND d.flag = 3)$$) AS anti_join;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f LEFT JOIN rf_dim d ON f.k = d.k AND d.flag = 3$$) AS left_join;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f WHERE EXISTS (SELECT 1 FROM rf_dim d WHERE d.k = f.k AND d.flag = 3)$$) AS semi_join;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f WHERE NOT EXISTS (SELECT 1 FROM rf_dim d WHERE d.k = f.k AND d.flag = 3)$$) AS anti_join;
+
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.kb WHERE d.flag = 3$$) AS cross_type;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.tag = d.name WHERE d.flag = 3$$) AS text_key;
+SELECT rf_filters($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8$$) AS star_keeps_staged_scan;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8$$) AS star_keeps_staged_scan;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_fact_heap g ON f.k = g.id$$) AS probe_under_motion;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k$$) AS unselective;
+SELECT rf_same($$SELECT md5(string_agg(x::text || ':' || c::text, ',' ORDER BY x)) FROM (VALUES (1), (2), (3)) v(x), LATERAL (SELECT count(*) c FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = v.x) q$$) AS rescan;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt$$) AS two_keys_second_chosen;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_heap f JOIN rf_dim_mk_k d ON f.amt = d.amt AND f.k = d.k;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_heap f JOIN rf_dim_mk_k d ON f.amt = d.amt AND f.k = d.k$$) AS two_keys_nulls;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k AND f.tag = d.name$$) AS two_keys_neither_selective;
+
+-- A partitioned AOCO fact: the filter leads the dynamic scan's Staged Scan
+-- in every partition.
+CREATE TABLE rf_fact_part(id int, k int, amt int, tag text)
+	USING ao_column WITH (compresstype = zstd, compresslevel = 1)
+	DISTRIBUTED BY (id)
+	PARTITION BY RANGE (id) (START (1) END (200001) EVERY (50000));
+INSERT INTO rf_fact_part SELECT id, k, amt, tag FROM rf_fact_heap;
+ANALYZE rf_fact_part;
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(f.amt) FROM rf_fact_part f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+SELECT count(*), sum(f.amt) FROM rf_fact_part f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_part f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$) AS partitioned;
+
+RESET optimizer;
+RESET whpg_runtime_filter_min_probe_rows;
+RESET search_path;
+DROP SCHEMA runtime_filter CASCADE;

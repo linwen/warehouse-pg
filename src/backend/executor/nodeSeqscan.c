@@ -89,6 +89,14 @@ SeqNext(SeqScanState *node)
 		node->ss.ss_currentScanDesc = scandesc;
 
 		/*
+		 * WHPG: a Staged Scan evaluates the plan's qual inside the access
+		 * method, in ExprContexts of its own; give it the exec Params a
+		 * runtime filter clause reads (runtimefilter.c).
+		 */
+		if (RelationIsAoCols(scandesc->rs_rd))
+			((AOCSScanDesc) scandesc)->stagedParamExecVals = estate->es_param_exec_vals;
+
+		/*
 		 * GPDB: the counts a staged scan keeps on its instrumentation start
 		 * from zero on a fresh descriptor, so the high-water marks that
 		 * SeqScanSyncStagedInstrumentation() compares them with must too.

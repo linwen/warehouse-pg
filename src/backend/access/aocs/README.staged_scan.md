@@ -82,9 +82,14 @@ path. The small first batch bounds the time to the first row: a `LIMIT`, an
 segfile), while batch switches cost nothing measurable, so a full scan is
 unaffected. The first batch of a single-stage predicate is also the sample
 for the fallback checks below and keeps filling until Phase A has crossed 64
-blocks, whatever its size (or until the array is full): on a sparse predicate
-those blocks pass in milliseconds, on a dense one they hold the evidence for
-falling back. (An earlier version collected a whole segfile's survivors first and fell
+blocks (`whpg_staged_scan_density_min_blocks`), whatever its size (or until the
+array is full): on a sparse predicate those blocks pass in milliseconds, on a
+dense one they hold the evidence for falling back. A segment file that ends
+before then is never handed back: Phase A's cost is sunk, and the ordinary
+scan would read every column again and evaluate the predicate on every row a
+second time, where Phase B fetches the survivors' columns once -- on TPC-DS
+q89, 111 partition scans of 16 blocks each with 11% survivors fell back and
+ran a third slower than staying staged. (An earlier version collected a whole segfile's survivors first and fell
 back to the ordinary scan past a fixed cap, which on large tables turned the
 most profitable scans into the slowest ones.)
 
@@ -219,8 +224,9 @@ and falls back to `aocs_getnext()` silently. Falling back is only possible
 while no row of the segment has been emitted, that is before the first
 survivor batch is handed over, because it hands the segment to
 `aocs_getnext()` with the projected streams still on their first block. The
-one data-dependent fallback left, the single-stage selectivity re-check below,
-is therefore made on the first batch.
+one data-dependent fallback left, the single-stage cost re-check below, is
+therefore made on the first batch, and only while that batch is still short
+of the segment file's end.
 
 The scan node runs no qual of its own on a Staged Scan plan. `ExecInitSeqScan`
 sees the plan flag on an AOCO relation and initializes the node without a
@@ -283,12 +289,23 @@ correlation -0.09, 70% faster with Staged Scan, declined by the pessimistic
 estimate). A single-stage predicate the estimate declines is therefore
 re-costed as if its column were perfectly clustered, and when that says yes
 the executor gets the scan and decides on evidence: the first batch of
-survivors shows how many of Phase A's blocks they occupy, and Phase A falls
-back to the ordinary scan before any row is emitted if they are dense
-(`stagedscan_survivors_too_dense()`, the same per-column estimate on observed
-h, s and rows per block, judged once at least 64 blocks have been crossed so
-that a dense band is not mistaken for a dense table, falling back when Phase
-B is estimated at 90% or more of the ordinary scan). Only a single stage can
+survivors shows how many of Phase A's blocks they occupy and how many rows
+survive, and Phase A hands the scan back to the ordinary scan before any row
+is emitted if that scan is clearly cheaper for what is left
+(`stagedscan_fallback_cheaper()`: Phase B on the prefix and the rest, plus
+Phase A on the rest, against the ordinary scan of prefix and rest -- the
+same per-column estimate on observed h, s and rows per block, summed over
+the columns each side walks, then a tuple per survivor on one side and a
+tuple and the predicate per row on the other; judged once at least 64
+blocks have been crossed so that a dense band is not mistaken for a dense
+table, never on a segment file Phase A has already read to its end, and
+only when the ordinary scan comes out `whpg_staged_scan_fallback_margin`
+cheaper). The planner's 10% gate is not re-applied: a predicate keeping a
+fifth of the rows measured a third faster staged, because the rows it drops
+are never assembled; the earlier block-spread check, which fell back
+whenever survivors sat in nearly every block, lost twice over on exactly
+the predicates Staged Scan is for (one survivor per block: 12 ms staged,
+25 ms ordinary, 25 ms fallen back). Only a single stage can
 fall back, which is why the optimistic retry is limited to one filter
 column. A first batch with no survivor at all is never dense: Phase B has
 nothing to walk. Plain EXPLAIN therefore shows `Staged Seq Scan` for some

@@ -55,6 +55,7 @@
 #include "utils/resscheduler.h"
 #include "utils/resgroup.h"
 #include "utils/resource_manager.h"
+#include "utils/runtimefilter.h"
 #include "utils/varlena.h"
 #include "utils/vmem_tracker.h"
 #include "optimizer/optimizer.h"
@@ -264,6 +265,8 @@ bool		gp_enable_hashjoin_size_heuristic = false;
 /* Staged Scan (AOCO two-phase scan) -- see cdbaocsam_stagedscan.h */
 bool		whpg_enable_staged_scan = true;
 double		whpg_staged_scan_min_selectivity = 0.10;
+int			whpg_staged_scan_density_min_blocks = 64;
+double		whpg_staged_scan_fallback_margin = 0.25;
 bool		gp_enable_predicate_propagation = false;
 bool		gp_enable_minmax_optimization = true;
 bool		gp_enable_multiphase_agg = true;
@@ -704,6 +707,27 @@ struct config_bool ConfigureNamesBool_gp[] =
 		},
 		&whpg_enable_staged_scan,
 		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"whpg_enable_runtime_filter", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables runtime filters: a hash join hands its probe scan a filter over the join keys."),
+			gettext_noop("Applies when the probe side's scan runs in the same slice as the join; "
+						 "the scan drops rows that cannot have a match before assembling them."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&whpg_enable_runtime_filter,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"whpg_runtime_filter_explain", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("EXPLAIN says why a hash join got no runtime filter."),
+			gettext_noop("A \"Runtime Filter: declined: ...\" line under each hash join the planner looked at and gave none."),
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&whpg_runtime_filter_explain,
+		false,
 		NULL, NULL, NULL
 	},
 	{
@@ -4066,6 +4090,37 @@ struct config_int ConfigureNamesInt_gp[] =
 	},
 
 	{
+		{"whpg_runtime_filter_max_size", PGC_USERSET, QUERY_TUNING_OTHER,
+			gettext_noop("Maximum size of one runtime filter."),
+			gettext_noop("A hash join whose inner side would need a larger filter to stay "
+						 "useful gets none; a filter that turns out too dense is dropped."),
+			GUC_UNIT_KB | GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&whpg_runtime_filter_max_size,
+		4096, 64, 524288,
+		NULL, NULL, NULL
+	},
+	{
+		{"whpg_runtime_filter_min_probe_rows", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Estimated probe rows below which a hash join gets no runtime filter."),
+			NULL,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&whpg_runtime_filter_min_probe_rows,
+		10000, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+	{
+		{"whpg_staged_scan_density_min_blocks", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Varblocks Phase A of a Staged Scan must have crossed before its first batch can send the segment file back to the ordinary scan."),
+			gettext_noop("A segment file that ends before that many blocks is scanned staged whatever its first batch shows."),
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&whpg_staged_scan_density_min_blocks,
+		64, 1, INT_MAX,
+		NULL, NULL, NULL
+	},
+	{
 		{"gp_blockdirectory_entry_min_range", PGC_USERSET, GP_ARRAY_TUNING,
 			gettext_noop("Minimal range in bytes one block directory entry covers."),
 			gettext_noop("Used to reduce the size of a block directory."),
@@ -4516,6 +4571,36 @@ struct config_real ConfigureNamesReal_gp[] =
 		},
 		&whpg_staged_scan_min_selectivity,
 		0.10, 0.0, 1.0,
+		NULL, NULL, NULL
+	},
+	{
+		{"whpg_staged_scan_fallback_margin", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("How much cheaper the ordinary scan must be estimated, on the first batch, for a Staged Scan to hand the scan back to it."),
+			gettext_noop("A fraction of the estimated cost of staying staged; the estimate rests on the blocks Phase A has crossed. A large value never falls back on cost."),
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&whpg_staged_scan_fallback_margin,
+		0.25, 0.0, 100.0,
+		NULL, NULL, NULL
+	},
+	{
+		{"whpg_runtime_filter_max_selectivity", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Estimated fraction of probe rows with a match above which a hash join gets no runtime filter."),
+			NULL,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&whpg_runtime_filter_max_selectivity,
+		0.5, 0.0, 1.0,
+		NULL, NULL, NULL
+	},
+	{
+		{"whpg_runtime_filter_disable_ratio", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Fraction of probe rows a runtime filter may let through before the scan stops using it."),
+			gettext_noop("Checked every few thousand rows once enough have been seen; 1 never switches a filter off."),
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&whpg_runtime_filter_disable_ratio,
+		0.95, 0.0, 1.0,
 		NULL, NULL, NULL
 	},
 

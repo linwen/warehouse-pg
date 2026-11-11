@@ -56,6 +56,8 @@ struct DatumStreamRead;
 /* GUCs -- see guc_gp.c */
 extern bool whpg_enable_staged_scan;
 extern double whpg_staged_scan_min_selectivity;
+extern int	whpg_staged_scan_density_min_blocks;
+extern double whpg_staged_scan_fallback_margin;
 
 /*
  * The row numbers that survived Phase A, ascending: one batch of a segfile.
@@ -203,6 +205,16 @@ typedef struct StagedScanState
 	struct StagedScanSimpleClause *simple;
 	int			nsimple;
 	int			simpleLen;		/* attlen of the Phase A column: 2, 4 or 8 */
+
+	/*
+	 * Runtime filter clauses on the Phase A column (runtimefilter.c), probed
+	 * off the raw datum array beside 'simple' -- the hash function inlined
+	 * for the integer-like types -- rather than through the row-at-a-time
+	 * ExecQual(). Compiled with 'simple'; a block qualifies for the fast path
+	 * with either kind of clause present.
+	 */
+	struct StagedScanSimpleFilter *rfilters;
+	int			nrfilters;
 	int64		blocksFastA;	/* blocks Phase A tested through the fast path */
 	StagedScanClause *clauses;
 	int			nclauses;
@@ -325,6 +337,7 @@ typedef struct StagedScanState
 
 extern bool extractcolumns_from_node(Node *expr, bool *cols, AttrNumber natts);
 extern bool stagedscan_contains_param(Node *node);
+extern bool stagedscan_contains_foreign_param(Node *node);
 extern bool stagedscan_clause_can_fail(Node *clause);
 extern List *stagedscan_flatten_qual(List *qual);
 

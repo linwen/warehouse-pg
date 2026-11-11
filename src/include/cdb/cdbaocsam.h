@@ -354,6 +354,14 @@ typedef struct AOCSScanDescData
 	struct ExprContext *stagedFallbackEcontext;
 	int			stagedFallbackSeg;	/* last segment file counted as scanned
 									 * without Staged Scan, or -1 */
+
+	/*
+	 * WHPG: the executor's exec-param values, for a runtime filter clause in
+	 * 'stagedQual' (runtimefilter.c): the quals are evaluated here in
+	 * standalone ExprContexts, which otherwise carry none. Set by the scan
+	 * node once the scan is open, before the first row is asked for.
+	 */
+	struct ParamExecData *stagedParamExecVals;
 } AOCSScanDescData;
 
 typedef AOCSScanDescData *AOCSScanDesc;

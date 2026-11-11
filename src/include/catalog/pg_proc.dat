@@ -11597,3 +11597,15 @@
 
 { oid => 5066, descr => 'itemwise add two integer arrays',
    proname => 'array_add', prorettype => '_int4', proargtypes => '_int4 _int4', prosrc => 'array_int4_add' },
+
+# WHPG runtime filters for hash joins (runtimefilter.c): the probe put in a
+# scan's qual by the planner, and its selectivity support function. The
+# filter argument is of type internal, so SQL cannot call the probe: the
+# clause can only come from the planner, and its filter from the executor.
+{ oid => 7014, descr => 'runtime filter probe for hash joins (planner use)',
+   proname => 'whpg_rf_match', proisstrict => 'f', provolatile => 'i',
+   prosupport => 'whpg_rf_match_support', prorettype => 'bool',
+   proargtypes => 'internal anyelement oid float8', prosrc => 'whpg_rf_match' },
+{ oid => 7015, descr => 'planner support for whpg_rf_match',
+   proname => 'whpg_rf_match_support', prorettype => 'internal', proargtypes => 'internal',
+   prosrc => 'whpg_rf_match_support' },

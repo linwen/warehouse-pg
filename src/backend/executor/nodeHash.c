@@ -45,6 +45,7 @@
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
 #include "utils/faultinjector.h"
+#include "utils/runtimefilter.h"
 #include "utils/syscache.h"
 
 #include "cdb/cdbexplain.h"
@@ -144,6 +145,44 @@ MultiExecHash(HashState *node)
 	return NULL;
 }
 
+/*
+ * WHPG: put the tuple's key into the probe scan's runtime filter. The filter
+ * is over one hash key (HashJoin.rf_keyidx). For a join on a single key that
+ * is the hash value the table takes, which is that key's. For a join on
+ * several the chosen key is hashed by itself -- as the probe scan's clause
+ * hashes its column (whpg_rf_match()) -- which costs this one more
+ * evaluation of the key per inner row. A NULL key is left out: the planner
+ * takes only strict operators (planrtfilter.c), so no probe row matches it.
+ * The tuple is econtext->ecxt_outertuple, as for ExecHashGetHashValue().
+ */
+static void
+ExecHashRuntimeFilterInsert(HashState *node, HashJoinTable hashtable,
+							ExprContext *econtext, uint32 hashvalue)
+{
+	int			idx = node->rf_keyidx;
+	ExprState  *keyexpr;
+	MemoryContext oldContext;
+	Datum		keyval;
+	bool		isNull;
+
+	if (list_length(node->hashkeys) == 1)
+	{
+		runtimefilter_insert(node->rf_builder, hashvalue);
+		return;
+	}
+
+	Assert(idx >= 0 && idx < list_length(node->hashkeys));
+	keyexpr = (ExprState *) list_nth(node->hashkeys, idx);
+	oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+	keyval = ExecEvalExpr(keyexpr, econtext, &isNull);
+	if (!isNull)
+		runtimefilter_insert(node->rf_builder,
+							 DatumGetUInt32(FunctionCall1Coll(&hashtable->inner_hashfunctions[idx],
+															  hashtable->collations[idx],
+															  keyval)));
+	MemoryContextSwitchTo(oldContext);
+}
+
 /* ----------------------------------------------------------------
  *		MultiExecPrivateHash
  *
@@ -194,6 +233,10 @@ MultiExecPrivateHash(HashState *node)
 								 &hashvalue, &hashkeys_null))
 		{
 			int			bucketNumber;
+
+			/* WHPG: the probe scan's runtime filter takes the key too */
+			if (node->rf_builder != NULL)
+				ExecHashRuntimeFilterInsert(node, hashtable, econtext, hashvalue);
 
 			bucketNumber = ExecHashGetSkewBucket(hashtable, hashvalue);
 			if (bucketNumber != INVALID_SKEW_BUCKET_NO)
@@ -403,6 +446,8 @@ ExecInitHash(Hash *node, EState *estate, int eflags)
 	hashstate->ps.ExecProcNode = ExecHash;
 	hashstate->hashtable = NULL;
 	hashstate->hashkeys = NIL;	/* will be set by parent HashJoin */
+	hashstate->rf_builder = NULL;	/* WHPG: set by the HashJoin, per build */
+	hashstate->rf_keyidx = -1;
 
 	/*
 	 * Miscellaneous initialization
