@@ -1463,8 +1463,9 @@ stagedscan_fallback_cheaper(StagedScanState *gi, AOCSScanDesc scan, double segRo
  * raw value as the join does -- inline for hashint2/4/8 (the hash functions
  * of the integer and datetime types), through fmgr for anything else. 'cur'
  * is the filter the Param holds for the block being tested, NULL when there
- * is none yet (or it was dropped), which lets every row through; 'probe'
- * carries the same switch-off whpg_rf_match() applies.
+ * is none yet (or it was dropped, or the Param does not hold one), which lets
+ * every row through. The switch-off whpg_rf_match() applies is the filter's
+ * own tally (runtimefilter_probe_count()), shared with the qual's probes.
  */
 typedef struct StagedScanSimpleFilter
 {
@@ -1473,7 +1474,6 @@ typedef struct StagedScanSimpleFilter
 	bool		inlineHash;
 	FmgrInfo	hashfn;
 	RuntimeFilter *cur;
-	RuntimeFilterProbe probe;
 } StagedScanSimpleFilter;
 
 /*
@@ -1749,11 +1749,8 @@ stagedscan_rf_bind(StagedScanState *gi)
 		if (prm == NULL || prm->isnull)
 			rf->cur = NULL;
 		else
-		{
 			rf->cur = (RuntimeFilter *)
 				runtimefilter_check((struct varlena *) DatumGetPointer(prm->value));
-			runtimefilter_probe_set(&rf->probe, rf->cur);
-		}
 	}
 }
 
@@ -1767,7 +1764,7 @@ stagedscan_rf_match(StagedScanState *gi, int64 v, int len)
 		uint32		hv;
 		bool		ok;
 
-		if (rf->cur == NULL || rf->probe.disabled)
+		if (rf->cur == NULL || rf->cur->disabled)
 			continue;
 		if (rf->inlineHash)
 			hv = runtimefilter_hash_int(v, len);
@@ -1777,7 +1774,7 @@ stagedscan_rf_match(StagedScanState *gi, int64 v, int len)
 												  len == 4 ? Int32GetDatum((int32) v) :
 												  Int16GetDatum((int16) v)));
 		ok = runtimefilter_contains(rf->cur, hv);
-		runtimefilter_probe_count(&rf->probe, ok);
+		runtimefilter_probe_count(rf->cur, ok);
 		if (!ok)
 			return false;
 	}

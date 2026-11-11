@@ -199,10 +199,12 @@ runtimefilter_merge(struct varlena *into, const struct varlena *other)
 }
 
 /*
- * A Param that does not hold a filter the hash join built must be refused
- * before it is read -- a guard against an executor or planner fault, since
- * SQL cannot call the probe; the Staged Scan's fast path reads the Param the
- * same way and checks the same.
+ * The filter a Param holds, or NULL if what it holds is not a filter the
+ * hash join built -- a guard against an executor or planner fault, since SQL
+ * cannot call the probe. NULL lets every row through, as a Param the join
+ * has not set does: a filter only ever drops rows the join would drop, so
+ * one that cannot be trusted is not an error, it is no filter. The Staged
+ * Scan's fast path reads the Param the same way.
  */
 struct varlena *
 runtimefilter_check(struct varlena *v)
@@ -213,9 +215,10 @@ runtimefilter_check(struct varlena *v)
 		f->magic != RF_MAGIC ||
 		f->log2_blocks > RF_MAX_LOG2_BLOCKS ||
 		VARSIZE(v) != RF_SIZE(f->log2_blocks))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid runtime filter")));
+	{
+		elog(DEBUG1, "runtime filter ignored: the parameter does not hold a filter");
+		return NULL;
+	}
 	return v;
 }
 
@@ -231,20 +234,35 @@ runtimefilter_check(struct varlena *v)
  * operator is strict, since the join never matches it then; a non-strict
  * operator hashes it as 0, as ExecHashGetHashValue() does (the planner gives
  * such a join no filter; this keeps the function true to the join). A filter
- * that turns out to pass nearly every row is switched off for the rest of the scan
- * (RuntimeFilterProbe in runtimefilter.h). 'hashop' is the
- * join's hash operator, whose left-hand operand is the key: the key is hashed
- * with that operator's left-hand hash support function, exactly as
+ * that turns out to pass nearly every row is switched off for the rest of
+ * the query (runtimefilter_probe_count() in runtimefilter.h). 'hashop' is
+ * the join's hash operator, whose left-hand operand is the key: the key is
+ * hashed with that operator's left-hand hash support function, exactly as
  * ExecHashTableCreate() hashes the probe side, looked up once per plan node.
  * The selectivity argument is read only by the planner, through the support
  * function below.
+ *
+ * The function cannot fail. Its arguments are checked once per plan node,
+ * as guards against a planner or executor fault (no caller but the planner's
+ * clause reaches them), and a clause that fails a check lets every row
+ * through from then on: a filter only ever drops rows the join would drop,
+ * so a clause that cannot be trusted is no filter, not an error. The fault
+ * is logged, once per plan node.
  */
 typedef struct RfMatchCache
 {
 	FmgrInfo	hashfn;
 	bool		opStrict;		/* does the hash operator reject NULL? */
-	RuntimeFilterProbe probe;	/* the adaptive switch-off, per filter */
+	bool		unusable;		/* a check failed: every row passes */
 } RfMatchCache;
+
+static void
+rf_match_give_up(RfMatchCache *cache, const char *why)
+{
+	cache->unusable = true;
+	ereport(LOG,
+			(errmsg("runtime filter ignored: %s", why)));
+}
 
 Datum
 whpg_rf_match(PG_FUNCTION_ARGS)
@@ -253,9 +271,6 @@ whpg_rf_match(PG_FUNCTION_ARGS)
 	RuntimeFilter *f;
 	uint32		hashvalue;
 	bool		result;
-
-	if (PG_ARGISNULL(0))
-		PG_RETURN_BOOL(true);
 
 	if (cache == NULL)
 	{
@@ -266,49 +281,59 @@ whpg_rf_match(PG_FUNCTION_ARGS)
 		Oid			lhsproc;
 		Oid			rhsproc;
 
-		/*
-		 * The operator is looked up once per plan node, so it has to be the
-		 * same on every row: the planner passes a Const. These checks, and
-		 * the ones below, guard against a planner fault; no caller but the
-		 * planner's clause reaches them.
-		 */
-		if (PG_ARGISNULL(2) || !get_fn_expr_arg_stable(fcinfo->flinfo, 2))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("runtime filter: the hash operator must be a constant")));
-		hashop = PG_GETARG_OID(2);
+		cache = (RfMatchCache *)
+			MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(RfMatchCache));
+		fcinfo->flinfo->fn_extra = cache;
 
 		/*
+		 * The operator is looked up once per plan node, so it has to be the
+		 * same on every row: the planner passes a Const.
+		 *
 		 * The key must be what the operator's left-hand hash function
 		 * expects, which is the operator's left-hand operand type (a date is
 		 * hashed by hashint4, so the function's own argument type would be
-		 * the wrong thing to compare with). The planner always pairs them
-		 * so. Only a hash operator's own support function is ever called
-		 * here. The function is not marked leakproof: it refuses a
-		 * malformed filter with an error, which a leakproof function must
-		 * not do, and nothing needs the mark -- the clause the planner
-		 * makes cannot fail, its filter being a Param the join sets, and the
-		 * Staged Scan knows it by that Param (stagedscan_clause_can_fail()).
+		 * the wrong thing to compare with), and one the operator hashes
+		 * (op_hashjoinable(): an array's elements need a hash function; the
+		 * planner pass makes this same test, planrtfilter.c). Only a hash
+		 * operator's own support function is ever called here.
+		 *
+		 * The function is not marked leakproof; nothing needs the mark --
+		 * the clause the planner makes cannot fail, its filter being a Param
+		 * the join sets, and the Staged Scan knows it by that Param
+		 * (stagedscan_clause_can_fail()).
 		 */
-		if (!OidIsValid(keytype) || !op_hashjoinable(hashop, keytype) ||
-			!get_op_hash_functions(hashop, &lhsproc, &rhsproc))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("runtime filter: operator %s is not hashable",
-							format_operator(hashop))));
-		op_input_types(hashop, &lefttype, &righttype);
-		if (!IsBinaryCoercible(keytype, lefttype))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("runtime filter: operator %s does not take the key type %s",
-							format_operator(hashop), format_type_be(keytype))));
-
-		cache = (RfMatchCache *)
-			MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(RfMatchCache));
-		fmgr_info_cxt(lhsproc, &cache->hashfn, fcinfo->flinfo->fn_mcxt);
-		cache->opStrict = op_strict(hashop);
-		fcinfo->flinfo->fn_extra = cache;
+		if (PG_ARGISNULL(2) || !get_fn_expr_arg_stable(fcinfo->flinfo, 2))
+			rf_match_give_up(cache, "the hash operator is not a constant");
+		else
+		{
+			hashop = PG_GETARG_OID(2);
+			if (!OidIsValid(keytype) || !op_hashjoinable(hashop, keytype) ||
+				!get_op_hash_functions(hashop, &lhsproc, &rhsproc))
+				rf_match_give_up(cache,
+								 psprintf("operator %s is not hashable for a key of type %s",
+										  format_operator(hashop),
+										  OidIsValid(keytype) ?
+										  format_type_be(keytype) : "unknown"));
+			else
+			{
+				op_input_types(hashop, &lefttype, &righttype);
+				if (!IsBinaryCoercible(keytype, lefttype))
+					rf_match_give_up(cache,
+									 psprintf("operator %s does not take the key type %s",
+											  format_operator(hashop),
+											  format_type_be(keytype)));
+				else
+				{
+					fmgr_info_cxt(lhsproc, &cache->hashfn, fcinfo->flinfo->fn_mcxt);
+					cache->opStrict = op_strict(hashop);
+				}
+			}
+		}
 	}
+
+	/* no filter (none built, or dropped), or a clause not to be trusted */
+	if (cache->unusable || PG_ARGISNULL(0))
+		PG_RETURN_BOOL(true);
 
 	/* a strict operator never matches a NULL key: the join drops the row */
 	if (PG_ARGISNULL(1) && cache->opStrict)
@@ -316,10 +341,14 @@ whpg_rf_match(PG_FUNCTION_ARGS)
 
 	/* an internal-typed argument: the pointer the hash join published */
 	f = (RuntimeFilter *) runtimefilter_check((struct varlena *) PG_GETARG_POINTER(0));
+	if (f == NULL)
+	{
+		rf_match_give_up(cache, "the parameter does not hold a filter");
+		PG_RETURN_BOOL(true);
+	}
 
-	/* a rebuilt hash table brings a new filter: judge it afresh */
-	runtimefilter_probe_set(&cache->probe, f);
-	if (cache->probe.disabled)
+	/* a filter that has shown itself useless lets the rows through */
+	if (f->disabled)
 		PG_RETURN_BOOL(true);
 
 	/* a non-strict operator's NULL key hashes as 0, as in the join */
@@ -330,7 +359,7 @@ whpg_rf_match(PG_FUNCTION_ARGS)
 													 PG_GET_COLLATION(),
 													 PG_GETARG_DATUM(1)));
 	result = runtimefilter_contains(f, hashvalue);
-	runtimefilter_probe_count(&cache->probe, result);
+	runtimefilter_probe_count(f, result);
 
 	PG_RETURN_BOOL(result);
 }

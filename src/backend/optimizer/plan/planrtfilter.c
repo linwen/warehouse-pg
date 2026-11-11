@@ -242,6 +242,17 @@ rf_find_probe_scan(Plan *outer, Node *key, SeqScan **scan, Node **scanKey,
 				((Var *) bare)->varattno <= 0)
 				return RF_PROBE_UNSUPPORTED;
 
+			/*
+			 * A relabel to a polymorphic type names no type to hash by:
+			 * GPORCA writes an array key as (karr)::anyarray, and the
+			 * probe looks its hash function up by the key's type
+			 * (whpg_rf_match()). The column's own type is what the join
+			 * hashes; the key is taken down to it.
+			 */
+			while (IsA(key, RelabelType) &&
+				   IsPolymorphicType(((RelabelType *) key)->resulttype))
+				key = (Node *) ((RelabelType *) key)->arg;
+
 			*scan = found;
 			*scanKey = copyObject(key);
 			*dynamic = IsA(cur, DynamicSeqScan);
@@ -441,6 +452,9 @@ rf_key_match_fraction(RuntimeFilterPlanContext *cx, HashJoin *hj, int i,
 	Assert(IsA(probeKey, Var));
 	probeVar = (Var *) probeKey;
 
+	if (scan->scan.scanrelid <= 0 ||
+		scan->scan.scanrelid > list_length(cx->rtable))
+		return false;
 	rte = rt_fetch(scan->scan.scanrelid, cx->rtable);
 	if (rte->rtekind != RTE_RELATION)
 		return false;
@@ -575,13 +589,19 @@ rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 			 * hashes the probe side, since the hash clause's left-hand
 			 * operand is the outer key.
 			 *
+			 * The key's type must be one the operator hashes -- an array
+			 * key is hashable only if its elements are (op_hashjoinable()).
+			 * It is the test whpg_rf_match() makes on the clause, made
+			 * here so that the two cannot disagree.
+			 *
 			 * The filter rejects a NULL probe key, as the join does -- but
 			 * the join only does so for a strict hash operator
 			 * (ExecHashGetHashValue()); a non-strict one hashes NULL as 0
 			 * and may match it. Such a key gets no filter.
 			 */
 			keyOp = list_nth_oid(hj->hashoperators, i);
-			if (!get_op_hash_functions(keyOp, &lhsHashProc, &rhsHashProc))
+			if (!get_op_hash_functions(keyOp, &lhsHashProc, &rhsHashProc) ||
+				!op_hashjoinable(keyOp, exprType(keyScanKey)))
 				keyDecline = RF_DECLINE_OP_NOT_HASHABLE;
 			else if (!op_strict(keyOp))
 				keyDecline = RF_DECLINE_OP_NOT_STRICT;
@@ -707,9 +727,12 @@ rf_plan_walker(Node *node, void *context)
 
 	/*
 	 * A subquery's plan has a range table of its own until the plan is
-	 * flattened; its scans cannot be looked up in ours.
+	 * flattened; its scans cannot be looked up in ours. The TABLE() argument
+	 * of a table function is such a subquery (create_tablefunction_plan()
+	 * plans it under its own subroot; set_plan_references() flattens both).
 	 */
-	if (IsA(node, SubqueryScan) && !cx->flatRtable)
+	if ((IsA(node, SubqueryScan) || IsA(node, TableFunctionScan)) &&
+		!cx->flatRtable)
 		return false;
 
 	/*

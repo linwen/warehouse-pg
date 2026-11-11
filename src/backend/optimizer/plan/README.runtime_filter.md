@@ -120,19 +120,28 @@ too full, a Parallel Hash) and false for a NULL key: a strict hash operator
 never matches a NULL, and the join types that get a filter drop such rows.
 A join over a non-strict hash operator, which hashes NULL as 0 and may match
 it (`ExecHashGetHashValue()`), gets no filter.
-It also watches its own usefulness: every 4096 rows, once 65536 have been
-tested, a filter that let more than `whpg_runtime_filter_disable_ratio` of
-them through is switched off for the rest of that scan node, and the rows
-go straight to the join -- the estimate was wrong, or the keys are all
-there, and every further probe would be a hash and a cache line for
-nothing. A rebuilt hash table brings a new filter, which is judged afresh.
+It also watches the filter's usefulness: every 4096 rows, once 65536 have
+been tested, a filter that let more than `whpg_runtime_filter_disable_ratio`
+of them through is switched off for the rest of the query, and the rows go
+straight to the join -- the estimate was wrong, or the keys are all there,
+and every further probe would be a hash and a cache line for nothing. The
+tally is kept in the filter itself (`RuntimeFilter.seen`, `.passed`,
+`.disabled`), so every probe of one filter in a process -- the qual's, the
+Staged Scan fast path's, each partition's scan under a dynamic scan -- counts
+into the same tally and gives it up together, rather than each starting the
+65536 rows over; a rebuilt hash table brings a new filter, judged afresh.
 The function cannot be called from SQL: its filter argument is of type
 `internal`, which no SQL expression yields (a scalar subquery, a prepared
 statement's parameter, a column are all of SQL types), so the parser never
-resolves it and the only caller is the planner's clause. It still refuses a
-Param that does not hold a filter, an operator that is not a hash operator
-or does not take the key's type, and an operator that is not a constant, as
-guards against a planner or executor fault.
+resolves it and the only caller is the planner's clause. It still checks,
+once per plan node, that the Param holds a filter, that the operator is a
+constant hash operator that takes the key's type and hashes it (an array
+key needs a hash function for its elements, `op_hashjoinable()`), as guards
+against a planner or executor fault -- and a clause that fails a check lets
+every row through from then on, with a LOG line, rather than fail the query:
+a filter only ever drops rows the join would drop, so an untrusted one is no
+filter, not an error. The planner pass makes the same tests before it
+writes a clause, so the guards should never fire.
 
 **The filter** is a split-block Bloom filter: 256-bit blocks of eight 32-bit
 words, one bit per word, so a probe touches a single cache line; it is fed
@@ -163,9 +172,8 @@ Param the join sets to NULL or to a filter it built, its operator and key
 type paired by the planner -- so it may be decided at any stage, ahead of
 clauses that can fail; `stagedscan_clause_can_fail()` knows it by that
 Param, which only the planner can write (`runtimefilter_is_clause()`: an
-exec Param of type `internal`). The function is not marked leakproof -- it
-refuses a malformed filter with an error, which a leakproof function must
-not do -- and nothing depends on the mark.
+exec Param of type `internal`). The function is not marked leakproof;
+nothing depends on the mark.
 
 Passing a lower join on the way to the scan is safe for the same reason. A
 probe row the filter drops before an inner, left, semi or anti join (the
@@ -201,8 +209,9 @@ call per row.
   "One key of several" below);
 - parallel-aware joins or scans (the Param would have to reach the workers);
 - a subquery's plan that still has its own range table (Postgres planner
-  before `set_plan_references()`; GPORCA's range table is flat and its
-  subplans are walked);
+  before `set_plan_references()`: a `SubqueryScan`'s plan and the `TABLE()`
+  argument of a table function are not entered; GPORCA's range table is
+  flat and its subplans are walked);
 - plans under row-level security, as for the Staged Scan;
 - a probe estimated below `whpg_runtime_filter_min_probe_rows`, a join
   expected to keep more than `whpg_runtime_filter_max_selectivity` of the
@@ -214,7 +223,7 @@ call per row.
 | GUC | default | meaning |
 |---|---|---|
 | `whpg_enable_runtime_filter` | on | master switch, both optimizers |
-| `whpg_runtime_filter_max_size` | 4 MB | the largest filter planned; a denser one is dropped at run time |
+| `whpg_runtime_filter_max_size` | 4 MB | the largest filter planned (64 kB to 64 MB; one per join and segment process, outside the join's operator memory); a denser one is dropped at run time |
 | `whpg_runtime_filter_max_selectivity` | 0.5 | developer: no filter when more of the probe is expected to match |
 | `whpg_runtime_filter_min_probe_rows` | 10000 | developer: no filter for a smaller probe (rows as the plan node estimates them) |
 | `whpg_runtime_filter_disable_ratio` | 0.95 | developer: a filter letting more of the probe rows through than this is switched off by the scan; 1 never switches off |

@@ -4097,7 +4097,7 @@ struct config_int ConfigureNamesInt_gp[] =
 			GUC_UNIT_KB | GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
 		},
 		&whpg_runtime_filter_max_size,
-		4096, 64, 524288,
+		4096, 64, 65536,
 		NULL, NULL, NULL
 	},
 	{

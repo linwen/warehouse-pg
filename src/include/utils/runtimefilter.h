@@ -57,7 +57,7 @@ extern struct varlena *runtimefilter_check(struct varlena *v);
  * the block, the bottom half the bit in each word through eight odd
  * multipliers.
  */
-#define RF_MAGIC				0x31465257	/* "WRF1": format and version */
+#define RF_MAGIC				0x32465257	/* "WRF2": format and version */
 #define RF_BLOCK_WORDS			8
 #define RF_BLOCK_BITS			(RF_BLOCK_WORDS * 32)
 
@@ -68,6 +68,19 @@ typedef struct RuntimeFilter
 	uint32		log2_blocks;
 	uint32		nkeys;			/* keys inserted, saturating */
 	uint32		flags;			/* none defined yet; equal on both sides of a merge */
+
+	/*
+	 * The switch-off's tally (runtimefilter_probe_count() below), kept in
+	 * the filter so that everything that probes it in this process -- the
+	 * scan's qual, a Staged Scan's fast path, every partition's scan under a
+	 * dynamic scan -- counts into one tally and gives the filter up together.
+	 * State of the process that probes, not content: a fresh filter starts
+	 * at zero, a merge leaves it alone.
+	 */
+	uint32		disabled;
+	uint64		seen;
+	uint64		passed;
+
 	uint32		blocks[FLEXIBLE_ARRAY_MEMBER];	/* RF_BLOCK_WORDS per block */
 } RuntimeFilter;
 
@@ -132,47 +145,29 @@ runtimefilter_hash_int(int64 v, int len)
 }
 
 /*
- * The probe watches its own usefulness: every RF_ADAPT_WINDOW rows, once at
- * least RF_ADAPT_MIN_ROWS have been tested, a filter that let more than
- * whpg_runtime_filter_disable_ratio of them through is switched off for the
- * rest of the scan, and the rows go straight to the join: the planner's
+ * The probe watches the filter's usefulness: every RF_ADAPT_WINDOW rows,
+ * once at least RF_ADAPT_MIN_ROWS have been tested, a filter that let more
+ * than whpg_runtime_filter_disable_ratio of them through is switched off for
+ * the rest of the query, and the rows go straight to the join: the planner's
  * estimate was wrong, or the keys are all present, and every probe from then
- * on would be a hash and a cache line for nothing. One of these per plan node
- * and filter; a rebuilt hash table brings a new filter, judged afresh.
+ * on would be a hash and a cache line for nothing. The tally is the
+ * filter's own, so all who probe one filter in a process share it -- a
+ * partitioned probe does not start over at every partition -- and a rebuilt
+ * hash table's new filter starts afresh. The caller tests f->disabled first.
  */
 #define RF_ADAPT_WINDOW			4096	/* a power of two */
 #define RF_ADAPT_MIN_ROWS		65536
 
-typedef struct RuntimeFilterProbe
-{
-	RuntimeFilter *filter;		/* the filter these counts are about */
-	int64		seen;
-	int64		passed;
-	bool		disabled;
-} RuntimeFilterProbe;
-
 static inline void
-runtimefilter_probe_set(RuntimeFilterProbe *p, RuntimeFilter *filter)
+runtimefilter_probe_count(RuntimeFilter *f, bool passed)
 {
-	if (filter != p->filter)
-	{
-		p->filter = filter;
-		p->seen = 0;
-		p->passed = 0;
-		p->disabled = false;
-	}
-}
-
-static inline void
-runtimefilter_probe_count(RuntimeFilterProbe *p, bool passed)
-{
-	p->seen++;
+	f->seen++;
 	if (passed)
-		p->passed++;
-	if ((p->seen & (RF_ADAPT_WINDOW - 1)) == 0 &&
-		p->seen >= RF_ADAPT_MIN_ROWS &&
-		(double) p->passed > whpg_runtime_filter_disable_ratio * (double) p->seen)
-		p->disabled = true;
+		f->passed++;
+	if ((f->seen & (RF_ADAPT_WINDOW - 1)) == 0 &&
+		f->seen >= RF_ADAPT_MIN_ROWS &&
+		(double) f->passed > whpg_runtime_filter_disable_ratio * (double) f->seen)
+		f->disabled = 1;
 }
 
 /*

@@ -3179,21 +3179,35 @@ show_scan_qual(List *qual, const char *qlabel,
 
 /*
  * WHPG: show a scan's runtime filter clauses (runtimefilter.c) by the
- * column each filters on, one line each: "Runtime Filter: k".
+ * column each filters on: one "Runtime Filter: k" line each in text, one
+ * list under the key in the other formats, where a key must not repeat.
  */
 static void
 show_runtime_filters(List *rfilters, PlanState *planstate, List *ancestors,
 					 ExplainState *es)
 {
+	bool		useprefix = (IsA(planstate->plan, SubqueryScan) || es->verbose);
+	List	   *context;
+	List	   *strs = NIL;
 	ListCell   *lc;
 
+	if (rfilters == NIL)
+		return;
+
+	context = set_deparse_context_planstate(es->deparse_cxt,
+											(Node *) planstate, ancestors);
 	foreach(lc, rfilters)
 	{
 		Node	   *key = runtimefilter_clause_key((Node *) lfirst(lc));
+		char	   *exprstr = deparse_expression(key, context, useprefix, false);
 
-		show_scan_qual(list_make1(key), "Runtime Filter", planstate,
-					   ancestors, es);
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+			ExplainPropertyText("Runtime Filter", exprstr, es);
+		else
+			strs = lappend(strs, exprstr);
 	}
+	if (strs != NIL)
+		ExplainPropertyList("Runtime Filter", strs, es);
 }
 
 /*

@@ -290,6 +290,42 @@ SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_f
  t
 (1 row)
 
+-- An array key. The key is hashed by the column's own type (its elements'
+-- hash function), so the clause carries that type, not the polymorphic
+-- anyarray GPORCA relabels the key to; the planner tests the key's type as
+-- the probe function will, so the two cannot disagree.
+CREATE TABLE rf_dim_arr(k int, karr int[], flag int) DISTRIBUTED BY (k);
+INSERT INTO rf_dim_arr SELECT i, ARRAY[i, i % 7], i % 50 FROM generate_series(1, 5000) i;
+CREATE TABLE rf_fact_arr(id int, karr int[]) DISTRIBUTED BY (id);
+INSERT INTO rf_fact_arr
+	SELECT i, ARRAY[(i * 7919) % 6000 + 1, ((i * 7919) % 6000 + 1) % 7]
+	  FROM generate_series(1, 20000) i;
+ANALYZE rf_dim_arr;
+ANALYZE rf_fact_arr;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_arr f JOIN rf_dim_arr d ON f.karr = d.karr WHERE d.flag = 3;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (f.karr = d.karr)
+                     ->  Seq Scan on rf_fact_arr f
+                           Runtime Filter: karr
+                     ->  Hash
+                           ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                 ->  Seq Scan on rf_dim_arr d
+                                       Filter: (flag = 3)
+ Optimizer: Postgres-based planner
+(12 rows)
+
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_arr f JOIN rf_dim_arr d ON f.karr = d.karr WHERE d.flag = 3$$) AS array_key;
+ array_key 
+-----------
+ t
+(1 row)
+
 -- A probe under a Motion gets no filter: both sides large, the fact is
 -- redistributed to the other table's key.
 SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_fact_heap g ON f.k = g.id$$) AS probe_under_motion;
@@ -1045,6 +1081,35 @@ SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_f
  t
 (1 row)
 
+-- The array key GPORCA relabels to anyarray: the filter is on the column,
+-- hashed by its own type. GPORCA expects every probe row to match (it has
+-- no statistics on an array column), so the selectivity gate is lifted.
+SET whpg_runtime_filter_max_selectivity = 1.0;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_arr f JOIN rf_dim_arr d ON f.karr = d.karr WHERE d.flag = 3;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: ((f.karr)::anyarray = (d.karr)::anyarray)
+                     ->  Seq Scan on rf_fact_arr f
+                           Runtime Filter: karr
+                     ->  Hash
+                           ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                 ->  Seq Scan on rf_dim_arr d
+                                       Filter: (flag = 3)
+ Optimizer: GPORCA
+(12 rows)
+
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_arr f JOIN rf_dim_arr d ON f.karr = d.karr WHERE d.flag = 3$$) AS array_key;
+ array_key 
+-----------
+ t
+(1 row)
+
+RESET whpg_runtime_filter_max_selectivity;
 SELECT rf_filters($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8$$) AS star_keeps_staged_scan;
  star_keeps_staged_scan 
 ------------------------
@@ -1166,17 +1231,41 @@ SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_f
  t
 (1 row)
 
+-- A useless filter on the partitioned fact is switched off once, for every
+-- partition's scan: the tally is the filter's own, not each scan's, so the
+-- partitions (50000 rows each, fewer than the 65536 the switch waits for)
+-- do not each start it over. Forty of the fifty flags keep four fifths of
+-- the dimension, which GPORCA still broadcasts (the whole dimension it
+-- would redistribute the fact to), and two probe rows in three match.
+SET whpg_runtime_filter_max_selectivity = 1.0;
+SET whpg_runtime_filter_disable_ratio = 0.5;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_part f JOIN rf_dim d ON f.k = d.k WHERE d.flag < 40$$) AS forced_partitioned;
+ forced_partitioned 
+--------------------
+ t
+(1 row)
+
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_part f JOIN rf_dim d ON f.k = d.k WHERE d.flag < 40$$) AS useless_filter_partitioned;
+ useless_filter_partitioned 
+----------------------------
+ t
+(1 row)
+
+RESET whpg_runtime_filter_disable_ratio;
+RESET whpg_runtime_filter_max_selectivity;
 RESET optimizer;
 RESET whpg_runtime_filter_min_probe_rows;
 RESET search_path;
 DROP SCHEMA runtime_filter CASCADE;
-NOTICE:  drop cascades to 20 other objects
+NOTICE:  drop cascades to 22 other objects
 DETAIL:  drop cascades to function runtime_filter.rf_planned(text)
 drop cascades to function runtime_filter.rf_same(text)
 drop cascades to table runtime_filter.rf_dim
 drop cascades to table runtime_filter.rf_fact_heap
 drop cascades to table runtime_filter.rf_fact_ao
 drop cascades to table runtime_filter.rf_fact_aoco
+drop cascades to table runtime_filter.rf_dim_arr
+drop cascades to table runtime_filter.rf_fact_arr
 drop cascades to table runtime_filter.rf_stale
 drop cascades to function runtime_filter.rf_nseq(integer,integer)
 drop cascades to operator runtime_filter.===(integer,integer)

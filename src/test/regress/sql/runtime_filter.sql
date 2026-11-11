@@ -120,6 +120,22 @@ EXPLAIN (COSTS OFF)
 SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.tag = d.name WHERE d.flag = 3;
 SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.tag = d.name WHERE d.flag = 3$$);
 
+-- An array key. The key is hashed by the column's own type (its elements'
+-- hash function), so the clause carries that type, not the polymorphic
+-- anyarray GPORCA relabels the key to; the planner tests the key's type as
+-- the probe function will, so the two cannot disagree.
+CREATE TABLE rf_dim_arr(k int, karr int[], flag int) DISTRIBUTED BY (k);
+INSERT INTO rf_dim_arr SELECT i, ARRAY[i, i % 7], i % 50 FROM generate_series(1, 5000) i;
+CREATE TABLE rf_fact_arr(id int, karr int[]) DISTRIBUTED BY (id);
+INSERT INTO rf_fact_arr
+	SELECT i, ARRAY[(i * 7919) % 6000 + 1, ((i * 7919) % 6000 + 1) % 7]
+	  FROM generate_series(1, 20000) i;
+ANALYZE rf_dim_arr;
+ANALYZE rf_fact_arr;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_arr f JOIN rf_dim_arr d ON f.karr = d.karr WHERE d.flag = 3;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_arr f JOIN rf_dim_arr d ON f.karr = d.karr WHERE d.flag = 3$$) AS array_key;
+
 -- A probe under a Motion gets no filter: both sides large, the fact is
 -- redistributed to the other table's key.
 SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_fact_heap g ON f.k = g.id$$) AS probe_under_motion;
@@ -371,6 +387,14 @@ SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f WHERE NOT EXISTS (SEL
 
 SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.kb WHERE d.flag = 3$$) AS cross_type;
 SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.tag = d.name WHERE d.flag = 3$$) AS text_key;
+-- The array key GPORCA relabels to anyarray: the filter is on the column,
+-- hashed by its own type. GPORCA expects every probe row to match (it has
+-- no statistics on an array column), so the selectivity gate is lifted.
+SET whpg_runtime_filter_max_selectivity = 1.0;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_arr f JOIN rf_dim_arr d ON f.karr = d.karr WHERE d.flag = 3;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_arr f JOIN rf_dim_arr d ON f.karr = d.karr WHERE d.flag = 3$$) AS array_key;
+RESET whpg_runtime_filter_max_selectivity;
 SELECT rf_filters($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8$$) AS star_keeps_staged_scan;
 SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k JOIN rf_dim_amt a ON f.amt = a.amt WHERE d.flag = 3 AND a.flag = 8$$) AS star_keeps_staged_scan;
 SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_fact_heap g ON f.k = g.id$$) AS probe_under_motion;
@@ -396,6 +420,19 @@ EXPLAIN (COSTS OFF)
 SELECT count(*), sum(f.amt) FROM rf_fact_part f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
 SELECT count(*), sum(f.amt) FROM rf_fact_part f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
 SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_part f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$) AS partitioned;
+
+-- A useless filter on the partitioned fact is switched off once, for every
+-- partition's scan: the tally is the filter's own, not each scan's, so the
+-- partitions (50000 rows each, fewer than the 65536 the switch waits for)
+-- do not each start it over. Forty of the fifty flags keep four fifths of
+-- the dimension, which GPORCA still broadcasts (the whole dimension it
+-- would redistribute the fact to), and two probe rows in three match.
+SET whpg_runtime_filter_max_selectivity = 1.0;
+SET whpg_runtime_filter_disable_ratio = 0.5;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_part f JOIN rf_dim d ON f.k = d.k WHERE d.flag < 40$$) AS forced_partitioned;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_part f JOIN rf_dim d ON f.k = d.k WHERE d.flag < 40$$) AS useless_filter_partitioned;
+RESET whpg_runtime_filter_disable_ratio;
+RESET whpg_runtime_filter_max_selectivity;
 
 RESET optimizer;
 RESET whpg_runtime_filter_min_probe_rows;
