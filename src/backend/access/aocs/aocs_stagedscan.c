@@ -1546,32 +1546,24 @@ stagedscan_compile_simple(StagedScanState *gi, List *quals, TupleDesc tupdesc)
 		int64		value;
 
 		/*
-		 * A runtime filter on this column: the same checks the qual's probe
-		 * makes (runtimefilter_probe_init()), made once here, so that the
-		 * block loop can hash the raw value and probe the filter directly.
+		 * A runtime filter on this column: the test the planner made before
+		 * it wrote the clause and the qual's probe makes before it trusts it
+		 * (runtimefilter_key_hashable()), made once here, so that the block
+		 * loop can hash the raw value and probe the filter directly.
 		 */
 		if (runtimefilter_is_clause(clause))
 		{
 			RuntimeFilterExpr *rfexpr = (RuntimeFilterExpr *) clause;
 			Node	   *key = (Node *) rfexpr->key;
-			Oid			opno = rfexpr->hashop;
 			Oid			lhsproc;
-			Oid			rhsproc;
-			Oid			lefttype;
-			Oid			righttype;
 
 			if (!IsA(key, Var) ||
 				((Var *) key)->varattno != attno + 1 ||
 				((Var *) key)->varlevelsup != 0 ||
 				((Var *) key)->vartype != att->atttypid)
 				return;
-			if (!OidIsValid(opno))
-				return;
-			if (!op_hashjoinable(opno, att->atttypid) ||
-				!get_op_hash_functions(opno, &lhsproc, &rhsproc))
-				return;
-			op_input_types(opno, &lefttype, &righttype);
-			if (!IsBinaryCoercible(att->atttypid, lefttype))
+			if (!runtimefilter_key_hashable(rfexpr->hashop, att->atttypid,
+											&lhsproc, NULL))
 				return;
 
 			rf[nrf].paramid = rfexpr->paramid;

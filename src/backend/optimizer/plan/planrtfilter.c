@@ -39,10 +39,13 @@
  * otherwise; for a filter over one key of several, that key's share if it is
  * larger. It is carried in the clause for the cost models.
  *
- * The Param is set and read within one slice and nothing rescans by it, so
- * the plan needs no extParam entry for it; the pass therefore runs after
- * SS_finalize_plan(), which would otherwise take the scan's reference for
- * one nothing supplies.
+ * The pass runs over the plan in its final form, after set_plan_references()
+ * for the Postgres planner and over GPORCA's plan as it comes: one range
+ * table for the plan and its subplans, the hash keys as references into the
+ * children's target lists. The Param is set and read within one slice and
+ * nothing rescans by it, so the plan needs no extParam entry for it; the
+ * pass therefore also runs after SS_finalize_plan(), which would otherwise
+ * take the scan's reference for one nothing supplies.
  *
  * Portions Copyright (c) 2026, WarehousePG contributors.
  *
@@ -77,7 +80,6 @@ typedef struct RuntimeFilterPlanContext
 	PlannerGlobal *glob;
 	List	   *rtable;			/* what the plan's scanrelids index */
 	List	  **paramExecTypes;	/* where a new Param is declared */
-	bool		flatRtable;		/* one range table for the whole plan */
 } RuntimeFilterPlanContext;
 
 /*
@@ -357,10 +359,9 @@ rf_column_ndistinct(Relation rel, AttrNumber attnum)
 
 /*
  * The base column 'key' names, looked for down the plan from 'plan' through
- * the target lists its Vars refer to -- OUTER_VAR and INNER_VAR, as GPORCA's
- * plans and set_plan_references() write them -- to a Var of a range table
- * relation, which the Postgres planner's Vars are before
- * set_plan_references(). False for any other shape: an expression, a
+ * the target lists its Vars refer to (OUTER_VAR and INNER_VAR, as the final
+ * form of a plan writes them) to a Var of a range table relation, which a
+ * scan's own Vars are. False for any other shape: an expression, a
  * subquery's or an Append's column.
  */
 static bool
@@ -555,8 +556,6 @@ rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 		Node	   *keyScanKey;
 		bool		keyDynamic;
 		Oid			keyOp = InvalidOid;
-		Oid			lhsHashProc;
-		Oid			rhsHashProc;
 		double		keySel = 1.0;
 		int			keyDecline = RF_DECLINE_NONE;
 
@@ -581,17 +580,15 @@ rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 
 		if (keyDecline == RF_DECLINE_NONE)
 		{
+			bool		opStrict;
+
 			/*
 			 * The clause carries the hash operator; the probe hashes the key
 			 * with its left-hand hash function, as ExecHashTableCreate()
 			 * hashes the probe side, since the hash clause's left-hand
-			 * operand is the outer key.
-			 *
-			 * The key's type must be one the operator hashes -- an array
-			 * key is hashable only if its elements are (op_hashjoinable()).
-			 * It is the test the executor's probe makes on the clause
-			 * (runtimefilter_probe_init()), made here so that the two
-			 * cannot disagree.
+			 * operand is the outer key. Whether the key can be so hashed is
+			 * the one test the probe and the Staged Scan make too
+			 * (runtimefilter_key_hashable()), so the three cannot disagree.
 			 *
 			 * The filter rejects a NULL probe key, as the join does -- but
 			 * the join only does so for a strict hash operator
@@ -599,10 +596,10 @@ rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 			 * and may match it. Such a key gets no filter.
 			 */
 			keyOp = list_nth_oid(hj->hashoperators, i);
-			if (!get_op_hash_functions(keyOp, &lhsHashProc, &rhsHashProc) ||
-				!op_hashjoinable(keyOp, exprType(keyScanKey)))
+			if (!runtimefilter_key_hashable(keyOp, exprType(keyScanKey),
+											NULL, &opStrict))
 				keyDecline = RF_DECLINE_OP_NOT_HASHABLE;
-			else if (!op_strict(keyOp))
+			else if (!opStrict)
 				keyDecline = RF_DECLINE_OP_NOT_STRICT;
 		}
 
@@ -725,19 +722,12 @@ rf_plan_walker(Node *node, void *context)
 		return false;
 
 	/*
-	 * A subquery's plan has a range table of its own until the plan is
-	 * flattened; its scans cannot be looked up in ours. The TABLE() argument
-	 * of a table function is such a subquery (create_tablefunction_plan()
-	 * plans it under its own subroot; set_plan_references() flattens both).
-	 */
-	if ((IsA(node, SubqueryScan) || IsA(node, TableFunctionScan)) &&
-		!cx->flatRtable)
-		return false;
-
-	/*
 	 * Children first: in a chain of joins over one scan the lowest join's
 	 * filter is decided before the ones above it (see rf_consider_hashjoin()).
-	 * Subplans are walked by runtimefilter_decide_plan(), once each.
+	 * The plan is in its final form, with one range table for it and its
+	 * subplans, so a SubqueryScan's or a TableFunctionScan's plan is entered
+	 * like any other node's; SubPlans are walked by
+	 * runtimefilter_decide_plan(), once each.
 	 */
 	(void) plan_tree_walker(node, rf_plan_walker, context, false);
 
@@ -748,16 +738,17 @@ rf_plan_walker(Node *node, void *context)
 }
 
 /*
- * Decide runtime filters for a finished plan. 'rtable' is the range table
- * the plan's scanrelids index: the final one for a GPORCA plan (flat, and
- * then 'subplans' are walked too), the query's for the Postgres planner's
- * (whose subqueries keep their own until set_plan_references()).
- * 'paramExecTypes' is the list a new Param's type is appended to.
+ * Decide runtime filters for a plan in its final form: 'rtable' is the one
+ * range table the plan's and the 'subplans'' scanrelids index (GPORCA's
+ * plans come so; the Postgres planner's are so after set_plan_references()),
+ * and the hash keys refer to the children's target lists (OUTER_VAR,
+ * INNER_VAR). 'paramExecTypes' is the list a new Param's type is appended
+ * to.
  */
 void
 runtimefilter_decide_plan(PlannerGlobal *glob, Plan *plan, List *subplans,
 						  List *rtable, List **paramExecTypes,
-						  bool flatRtable, bool hasRowSecurity)
+						  bool hasRowSecurity)
 {
 	RuntimeFilterPlanContext cx;
 	PlannerInfo *root;
@@ -785,7 +776,6 @@ runtimefilter_decide_plan(PlannerGlobal *glob, Plan *plan, List *subplans,
 	cx.glob = glob;
 	cx.rtable = rtable;
 	cx.paramExecTypes = paramExecTypes;
-	cx.flatRtable = flatRtable;
 
 	(void) rf_plan_walker((Node *) plan, &cx);
 	foreach(lc, subplans)

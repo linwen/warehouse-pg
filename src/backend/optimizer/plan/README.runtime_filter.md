@@ -16,7 +16,7 @@ Code:
 | the filter: a split-block Bloom filter in a bytea, build/insert/finish/probe | `src/backend/utils/adt/runtimefilter.c` |
 | the probe: `RuntimeFilterExpr` (primnodes.h), the clause the planner puts in the scan's qual, which the executor compiles to a step of its own (`EEOP_RUNTIME_FILTER`); no catalog entry | same file; `execExpr.c`, `execExprInterp.c` |
 | the planner pass: which joins, which scan, the Param, the clause | `src/backend/optimizer/plan/planrtfilter.c` |
-| hooks: after `SS_finalize_plan()` for the Postgres planner, after the Staged Scan pass for GPORCA | `planner.c` (`standard_planner`), `orca.c` (`optimize_query`) |
+| hooks: after `set_plan_references()` for the Postgres planner (the plan in its final form, as GPORCA's comes), after the Staged Scan pass for GPORCA | `planner.c` (`standard_planner`), `orca.c` (`optimize_query`) |
 | building the filter while the table is built | `nodeHash.c` (`MultiExecPrivateHash`) |
 | publishing it through the Param; the table built before the first probe row when the filter leads a Staged Scan | `nodeHashjoin.c` (`ExecHashJoin*RuntimeFilter`) |
 | the Staged Scan reading the Param inside the access method | `nodeSeqscan.c`, `aocsam.c`, `aocs_stagedscan.c`, `stagedscancost.c` |
@@ -217,10 +217,6 @@ call per row.
   one by, or when no key alone is expected to drop enough probe rows (see
   "One key of several" below);
 - parallel-aware joins or scans (the Param would have to reach the workers);
-- a subquery's plan that still has its own range table (Postgres planner
-  before `set_plan_references()`: a `SubqueryScan`'s plan and the `TABLE()`
-  argument of a table function are not entered; GPORCA's range table is
-  flat and its subplans are walked);
 - plans under row-level security, as for the Staged Scan;
 - a probe estimated below `whpg_runtime_filter_min_probe_rows`, a join
   expected to keep more than `whpg_runtime_filter_max_selectivity` of the

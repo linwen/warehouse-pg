@@ -3286,10 +3286,10 @@ EXECUTE p6;
 
 DEALLOCATE p6;
 -- The TABLE() argument is planned as a subquery with a range table of its
--- own. The runtime filter pass over the outer plan (planrtfilter.c) runs
--- before the range tables are flattened and must not read the subquery's
--- scans through the outer one: a join on two keys looks the probe's
--- statistics up by range table index.
+-- own until set_plan_references() flattens it into the plan's. The runtime
+-- filter pass (planrtfilter.c) runs after that and enters the subquery's
+-- plan: a join on two keys there looks the probe's statistics up by range
+-- table index, and gets a filter over the selective key.
 CREATE TABLE tf_rf_probe(id int, k int, k2 int) DISTRIBUTED BY (id);
 INSERT INTO tf_rf_probe SELECT i, i % 500, i % 7 FROM generate_series(1, 20000) i;
 CREATE TABLE tf_rf_build(k int, k2 int, flag int) DISTRIBUTED BY (k);
@@ -3307,6 +3307,7 @@ SELECT * FROM multiset_2(TABLE(SELECT p.id, 'x'::text FROM tf_rf_probe p JOIN tf
          ->  Hash Join
                Hash Cond: ((p.k = b.k) AND (p.k2 = b.k2))
                ->  Seq Scan on tf_rf_probe p
+                     Runtime Filter: k
                ->  Hash
                      ->  Broadcast Motion 3:3  (slice2; segments: 3)
                            ->  Seq Scan on tf_rf_build b

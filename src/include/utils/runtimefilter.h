@@ -183,6 +183,15 @@ extern Node *runtimefilter_clause_key(const Node *clause);
 extern void runtimefilter_split_qual(List *qual, List **filters, List **rest);
 
 /*
+ * Can a probe key of type 'keytype' be tested against a filter of the hash
+ * values a join computed with 'hashop'? The one answer the planner pass, the
+ * probe and the Staged Scan's compile step all take, so that none of them
+ * can write or read a clause the others would not.
+ */
+extern bool runtimefilter_key_hashable(Oid hashop, Oid keytype,
+									   Oid *hashproc, bool *strict);
+
+/*
  * The executor's state for one RuntimeFilterExpr. execExpr.c compiles the
  * node to an EEOP_RUNTIME_FILTER step that owns one: the steps before it
  * leave the key in keyvalue/keynull, and runtimefilter_probe() tests it

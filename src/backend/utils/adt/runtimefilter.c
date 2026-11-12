@@ -252,53 +252,64 @@ rf_probe_give_up(RuntimeFilterProbeState *probe, const char *why)
 			(errmsg("runtime filter ignored: %s", why)));
 }
 
+/*
+ * The one test of a probe key against a hash operator, for the planner pass
+ * (before it writes a clause), the probe (before it trusts one) and the
+ * Staged Scan's compile step (before it takes one onto its fast path).
+ *
+ * The key is hashed by the operator's left-hand hash function, as
+ * ExecHashTableCreate() hashes the probe side, so the key must be what that
+ * function expects: the operator's left-hand operand type (a date is hashed
+ * by hashint4, so the key's own type would be the wrong thing to compare
+ * with), and one the operator hashes at all (op_hashjoinable(): an array's
+ * elements need a hash function). Only a hash operator's own support
+ * function is ever returned.
+ */
+bool
+runtimefilter_key_hashable(Oid hashop, Oid keytype, Oid *hashproc, bool *strict)
+{
+	Oid			lhsproc;
+	Oid			rhsproc;
+	Oid			lefttype;
+	Oid			righttype;
+
+	if (!OidIsValid(hashop) || !OidIsValid(keytype))
+		return false;
+	if (!op_hashjoinable(hashop, keytype) ||
+		!get_op_hash_functions(hashop, &lhsproc, &rhsproc))
+		return false;
+	op_input_types(hashop, &lefttype, &righttype);
+	if (!IsBinaryCoercible(keytype, lefttype))
+		return false;
+
+	if (hashproc)
+		*hashproc = lhsproc;
+	if (strict)
+		*strict = op_strict(hashop);
+	return true;
+}
+
 RuntimeFilterProbeState *
 runtimefilter_probe_init(const RuntimeFilterExpr *rfexpr)
 {
 	RuntimeFilterProbeState *probe;
 	Oid			keytype = exprType((Node *) rfexpr->key);
-	Oid			lefttype;
-	Oid			righttype;
-	Oid			lhsproc;
-	Oid			rhsproc;
+	Oid			hashproc;
 
 	probe = (RuntimeFilterProbeState *) palloc0(sizeof(RuntimeFilterProbeState));
 	probe->paramid = rfexpr->paramid;
 	probe->collation = rfexpr->collation;
 
-	/*
-	 * The key must be what the operator's left-hand hash function expects,
-	 * which is the operator's left-hand operand type (a date is hashed by
-	 * hashint4, so the key's own type would be the wrong thing to compare
-	 * with), and one the operator hashes (op_hashjoinable(): an array's
-	 * elements need a hash function; the planner pass makes this same test,
-	 * planrtfilter.c). Only a hash operator's own support function is ever
-	 * called here.
-	 */
-	if (!OidIsValid(rfexpr->hashop))
-		rf_probe_give_up(probe, "the clause names no hash operator");
-	else if (!OidIsValid(keytype) ||
-			 !op_hashjoinable(rfexpr->hashop, keytype) ||
-			 !get_op_hash_functions(rfexpr->hashop, &lhsproc, &rhsproc))
+	if (!runtimefilter_key_hashable(rfexpr->hashop, keytype,
+									&hashproc, &probe->opstrict))
 		rf_probe_give_up(probe,
-						 psprintf("operator %s is not hashable for a key of type %s",
-								  format_operator(rfexpr->hashop),
+						 psprintf("operator %s cannot hash a key of type %s",
+								  OidIsValid(rfexpr->hashop) ?
+								  format_operator(rfexpr->hashop) : "(none)",
 								  OidIsValid(keytype) ?
 								  format_type_be(keytype) : "unknown"));
 	else
-	{
-		op_input_types(rfexpr->hashop, &lefttype, &righttype);
-		if (!IsBinaryCoercible(keytype, lefttype))
-			rf_probe_give_up(probe,
-							 psprintf("operator %s does not take the key type %s",
-									  format_operator(rfexpr->hashop),
-									  format_type_be(keytype)));
-		else
-		{
-			fmgr_info(lhsproc, &probe->hashfn);
-			probe->opstrict = op_strict(rfexpr->hashop);
-		}
-	}
+		fmgr_info(hashproc, &probe->hashfn);
 	return probe;
 }
 

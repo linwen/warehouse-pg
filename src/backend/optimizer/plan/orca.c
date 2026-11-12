@@ -239,12 +239,13 @@ optimize_query(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	/*
 	 * WHPG: runtime filters for hash joins whose probe scan is in the same
 	 * slice (planrtfilter.c). Where one is added to an AOCO scan the Staged
-	 * Scan is decided again with it, hence after the pass above. ORCA's
-	 * range table is final and flat, so the subplans are walked too.
+	 * Scan is decided again with it, hence after the pass above. ORCA's plan
+	 * is in its final form, as the Postgres planner's is after
+	 * set_plan_references(), where that path runs the same pass.
 	 */
 	runtimefilter_decide_plan(glob, result->planTree, result->subplans,
 							  result->rtable, &result->paramExecTypes,
-							  true, parse->hasRowSecurity);
+							  parse->hasRowSecurity);
 
 	/*
 	 * To save on memory, and on the network bandwidth when the plan is

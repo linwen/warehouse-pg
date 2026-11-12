@@ -740,19 +740,6 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 			motion_sanity_check(root, top_plan);
 	}
 
-	/*
-	 * WHPG: runtime filters for hash joins whose probe scan is in the same
-	 * slice (planrtfilter.c). After SS_finalize_plan(): the exec Param a
-	 * filter travels through is set by the join and read by a scan below it,
-	 * which that pass would take for a reference to a parameter nothing
-	 * supplies; nothing rescans by it, so it needs no extParam entry. Before
-	 * set_plan_references(): the pass matches the join's hash key to the
-	 * scan by range table index.
-	 */
-	runtimefilter_decide_plan(glob, top_plan, NIL, root->parse->rtable,
-							  &glob->paramExecTypes, false,
-							  parse->hasRowSecurity);
-
 	top_plan = set_plan_references(root, top_plan);
 	/* ... and the subplans (both regular subplans and initplans) */
 	Assert(list_length(glob->subplans) == list_length(glob->subroots));
@@ -763,6 +750,20 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 
 		lfirst(lp) = set_plan_references(subroot, subplan);
 	}
+
+	/*
+	 * WHPG: runtime filters for hash joins whose probe scan is in the same
+	 * slice (planrtfilter.c), over the plan in its final form -- one range
+	 * table for the plan and its subplans, the hash keys as OUTER_VAR
+	 * references -- which is the form GPORCA's plans come in, so one pass
+	 * serves both. After SS_finalize_plan() too: the exec Param a filter
+	 * travels through is set by the join and read by a scan below it, which
+	 * that pass would take for a reference to a parameter nothing supplies;
+	 * nothing rescans by it, so it needs no extParam entry.
+	 */
+	runtimefilter_decide_plan(glob, top_plan, glob->subplans,
+							  glob->finalrtable, &glob->paramExecTypes,
+							  parse->hasRowSecurity);
 
 	/* fix ShareInputScans for EXPLAIN */
 	foreach(lp, glob->subplans)
