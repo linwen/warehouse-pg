@@ -18,7 +18,7 @@ Code:
 | the planner pass: which joins, which scan, the Param, the clause | `src/backend/optimizer/plan/planrtfilter.c` |
 | hooks: after `SS_finalize_plan()` for the Postgres planner, after the Staged Scan pass for GPORCA | `planner.c` (`standard_planner`), `orca.c` (`optimize_query`) |
 | building the filter while the table is built | `nodeHash.c` (`MultiExecPrivateHash`) |
-| publishing it through the Param, before the first probe row | `nodeHashjoin.c` (`ExecHashJoin*RuntimeFilter`) |
+| publishing it through the Param; the table built before the first probe row when the filter leads a Staged Scan | `nodeHashjoin.c` (`ExecHashJoin*RuntimeFilter`) |
 | the Staged Scan reading the Param inside the access method | `nodeSeqscan.c`, `aocsam.c`, `aocs_stagedscan.c`, `stagedscancost.c` |
 | plan fields | `HashJoin.rf_paramids` in `plannodes.h`; the clause itself is in `SeqScan.scan.plan.qual` |
 | EXPLAIN | `show_runtime_filters()` in `explain.c` |
@@ -88,11 +88,17 @@ clause hashes the probe column the same way.
 initialized (`ExecInitHashJoin`). When it builds the hash table it hands the
 Hash node a builder sized from the planner's estimate of the inner rows; the
 Hash node inserts every tuple's hash value -- the one it computes anyway for
-the bucket -- and the join then points the Param at the finished filter. Only
-then does it read the first probe row: a join with a filter never fetches an
-outer row first to check for an empty outer. On a rebuild (a rescan with the
-inner's parameters changed) the Param goes back to NULL and a new filter
-takes its place.
+the bucket -- and the join then points the Param at the finished filter. A
+join whose probe is a Staged Scan led by the filter builds the table before
+it asks for a probe row: the scan's first batch of survivors is the sample
+that decides whether the staged read pays, and a sample taken without the
+filter would have it fall back. Any other join keeps the executor's shortcut
+of fetching one outer row first, to end without a hash table when the outer
+is empty; that row went untested by the filter and is probed in the table
+like any row the filter lets through. On a rebuild (a rescan with the inner's
+parameters changed) the Param goes back to NULL and a new filter takes its
+place; a rescan that keeps the table keeps the filter, and the probe scan is
+read again through it.
 
 The probe side's scan evaluates the clause per row like any qual. On a heap
 or AO row table that is `ExecQual()` after the row is fetched: it saves the

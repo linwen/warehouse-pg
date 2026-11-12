@@ -172,10 +172,17 @@ static inline void SaveWorkFileSetStatsInfo(HashJoinTable hashtable);
  * The planner gave this join an exec Param that the probe scan's qual reads
  * through a RuntimeFilterExpr. While the Hash node builds the table it inserts
  * every hash value into a filter (nodeHash.c); once the table is complete
- * the join points the Param at the finished filter, before it reads a
- * single probe row. A NULL Param means "no filter" -- not built yet, dropped
- * as too dense for the keys it got, or a Parallel Hash, whose table several
- * processes build -- and lets every row through.
+ * the join points the Param at the finished filter. A NULL Param means "no
+ * filter" -- not built yet, dropped as too dense for the keys it got, or a
+ * Parallel Hash, whose table several processes build -- and lets every row
+ * through. So the one probe row the join may fetch before it builds the
+ * table, to end without one when the outer side is empty, is only a row the
+ * filter did not get to test; it is probed in the table like any row the
+ * filter lets through. The exception is a Staged Scan the filter leads
+ * (hj_rfBuildFirst): its first batch of survivors is the sample that decides
+ * whether the staged read pays, and a sample taken without the filter would
+ * have it fall back to a plain scan, so that probe gets no row to read
+ * before the filter is in place.
  */
 static void
 ExecHashJoinResetRuntimeFilter(HashJoinState *node)
@@ -232,10 +239,63 @@ ExecHashJoinPublishRuntimeFilter(HashJoinState *node, HashState *hashNode)
 		hashNode->rf_builder = NULL;
 	}
 
+#ifdef FAULT_INJECTOR
+	/* once per filter built, for the tests to count */
+	if (node->hj_rfFilter != NULL)
+		SIMPLE_FAULT_INJECTOR("runtime_filter_published");
+#endif
+
 	prm = &estate->es_param_exec_vals[node->hj_rfParamId];
 	prm->execPlan = NULL;
 	prm->value = PointerGetDatum(node->hj_rfFilter);
 	prm->isnull = (node->hj_rfFilter == NULL);
+}
+
+/*
+ * Is the probe a Staged Scan that reads this join's filter column in one of
+ * its stages? The scan is the join's outer input, through Result nodes and
+ * the outer side of lower joins, as the planner pass found it; any other
+ * shape, or a plain scan, answers no.
+ */
+static bool
+ExecHashJoinFilterLeadsStagedScan(HashJoin *hj)
+{
+	int			paramid = linitial_int(hj->rf_paramids);
+	Plan	   *plan = outerPlan(hj);
+
+	while (plan != NULL &&
+		   (IsA(plan, Result) || IsA(plan, HashJoin) ||
+			IsA(plan, NestLoop) || IsA(plan, MergeJoin)))
+		plan = outerPlan(plan);
+
+	if (plan != NULL && (IsA(plan, SeqScan) || IsA(plan, DynamicSeqScan)))
+	{
+		SeqScan    *scan = (SeqScan *) plan;
+		ListCell   *lc;
+
+		if (!scan->staged.enabled)
+			return false;
+
+		foreach(lc, plan->qual)
+		{
+			Node	   *clause = (Node *) lfirst(lc);
+			Node	   *key;
+
+			if (!runtimefilter_is_clause(clause) ||
+				((RuntimeFilterExpr *) clause)->paramid != paramid)
+				continue;
+
+			key = (Node *) ((RuntimeFilterExpr *) clause)->key;
+			while (key != NULL && IsA(key, RelabelType))
+				key = (Node *) ((RelabelType *) key)->arg;
+
+			return key != NULL && IsA(key, Var) &&
+				list_member_int(scan->staged.filterAttnos,
+								((Var *) key)->varattno);
+		}
+	}
+
+	return false;
 }
 
 /* ----------------------------------------------------------------
@@ -363,13 +423,17 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 						 */
 						node->hj_FirstOuterTupleSlot = NULL;
 					}
-					else if (node->hj_rfParamId >= 0)
+					else if (node->hj_rfBuildFirst)
 					{
 						/*
-						 * WHPG: the probe scan filters on the hash table's
-						 * keys, so the table is built first and every probe
-						 * row, the first included, is read through the
-						 * filter (ExecHashJoinPublishRuntimeFilter()).
+						 * WHPG: the probe is a Staged Scan led by this
+						 * join's runtime filter, and its first batch of
+						 * survivors is the sample that decides the staged
+						 * read: it gets no row to read before the filter is
+						 * in place. Any other probe takes the shortcut; the
+						 * one row it yields before the table is built went
+						 * untested by the filter and is probed in the table
+						 * like any row the filter lets through.
 						 */
 						node->hj_FirstOuterTupleSlot = NULL;
 					}
@@ -902,6 +966,8 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 		node->rf_paramids != NIL ? linitial_int(node->rf_paramids) : -1;
 	hjstate->hj_rfKeyIdx = node->rf_keyidx;
 	hjstate->hj_rfFilter = NULL;
+	hjstate->hj_rfBuildFirst = hjstate->hj_rfParamId >= 0 &&
+		ExecHashJoinFilterLeadsStagedScan(node);
 	ExecHashJoinResetRuntimeFilter(hjstate);
 
 	/*

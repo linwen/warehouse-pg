@@ -420,22 +420,74 @@ SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_stale s ON f.
 (1 row)
 
 RESET whpg_runtime_filter_max_size;
--- Rescans: the hash join rebuilt for every outer row of a nested loop, its
--- filter with it.
-SELECT rf_same($$SELECT md5(string_agg(x::text || ':' || c::text, ',' ORDER BY x)) FROM (VALUES (1), (2), (3)) v(x), LATERAL (SELECT count(*) c FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = v.x) q$$) AS rescan;
+-- Rescans. A hash join on the inner side of a nested loop runs again for
+-- every outer row; it keeps its hash table across those runs when its own
+-- inner side takes nothing from the outer row (ExecReScanHashJoin()), and
+-- the filter with it, so the probe scan is read again through the same
+-- filter. The dimension is replicated so that the join runs on the
+-- segments with no Motion inside it (a Motion under a rescanned node is
+-- materialized, and the join would run once); Material is off and the join
+-- above is an inequality, so the three-row side stays outer. The fault
+-- point runtime_filter_published fires once per filter built, and
+-- rf_filters_built(q) sums it over the segments: one per segment here,
+-- not one per outer row.
+CREATE TABLE rf_dim_rep (LIKE rf_dim) DISTRIBUTED REPLICATED;
+INSERT INTO rf_dim_rep SELECT * FROM rf_dim;
+ANALYZE rf_dim_rep;
+CREATE FUNCTION rf_filters_built(q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+	hits bigint;
+BEGIN
+	PERFORM public.gp_inject_fault_infinite('runtime_filter_published', 'skip', dbid)
+	   FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	EXECUTE q;
+	SELECT sum(substring(public.gp_inject_fault('runtime_filter_published', 'status', dbid)
+						 from 'num times hit:''(\d+)''')::bigint)
+	  INTO hits
+	  FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	PERFORM public.gp_inject_fault('runtime_filter_published', 'reset', dbid)
+	   FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	RETURN hits;
+END $$;
+SET enable_material = off;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM (SELECT DISTINCT flag FROM rf_dim_rep WHERE flag < 3) v
+	JOIN (SELECT f.id FROM rf_fact_aoco f JOIN rf_dim_rep d ON f.k = d.k WHERE d.flag = 3) q ON q.id % 100 >= v.flag * 30;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Nested Loop
+                     Join Filter: ((f.id % 100) >= (rf_dim_rep.flag * 30))
+                     ->  HashAggregate
+                           Group Key: rf_dim_rep.flag
+                           ->  Seq Scan on rf_dim_rep
+                                 Filter: (flag < 3)
+                     ->  Hash Join
+                           Hash Cond: (f.k = d.k)
+                           ->  Staged Seq Scan on rf_fact_aoco f
+                                 Runtime Filter: k
+                                 Stages: k
+                           ->  Hash
+                                 ->  Seq Scan on rf_dim_rep d
+                                       Filter: (flag = 3)
+ Optimizer: Postgres-based planner
+(18 rows)
+
+SELECT rf_filters_built($$SELECT count(*) FROM (SELECT DISTINCT flag FROM rf_dim_rep WHERE flag < 3) v JOIN (SELECT f.id FROM rf_fact_aoco f JOIN rf_dim_rep d ON f.k = d.k WHERE d.flag = 3) q ON q.id % 100 >= v.flag * 30$$) AS filters_built_one_per_segment;
+ filters_built_one_per_segment 
+-------------------------------
+                             3
+(1 row)
+
+SELECT rf_same($$SELECT count(*)::text FROM (SELECT DISTINCT flag FROM rf_dim_rep WHERE flag < 3) v JOIN (SELECT f.id FROM rf_fact_aoco f JOIN rf_dim_rep d ON f.k = d.k WHERE d.flag = 3) q ON q.id % 100 >= v.flag * 30$$) AS rescan;
  rescan 
 --------
  t
 (1 row)
 
-SELECT x, c FROM (VALUES (1), (2), (3)) v(x), LATERAL (SELECT count(*) c FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = v.x) q ORDER BY x;
- x |  c   
----+------
- 1 | 3316
- 2 | 3330
- 3 | 3337
-(3 rows)
-
+RESET enable_material;
 -- A cursor fetched in pieces: the filter is in place before the first row.
 BEGIN;
 DECLARE rf_cur CURSOR FOR SELECT f.id FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3 ORDER BY f.id;
@@ -1113,7 +1165,51 @@ SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d
  f
 (1 row)
 
-SELECT rf_same($$SELECT md5(string_agg(x::text || ':' || c::text, ',' ORDER BY x)) FROM (VALUES (1), (2), (3)) v(x), LATERAL (SELECT count(*) c FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = v.x) q$$) AS rescan;
+-- Rescans: a correlated subquery runs again for every outer row. GPORCA
+-- keeps the outer reference above the join, so the hash join inside keeps
+-- its table and filter across the runs, and the probe scan is read again
+-- through the filter. The fact is replicated so that the subquery runs on
+-- one segment with no Motion. (The Postgres planner materializes every scan
+-- of a correlated subplan and plans no filter there; its rescans are those
+-- of a nested loop, Part 1.)
+CREATE TABLE rf_fact_rep (LIKE rf_fact_heap)
+	USING ao_column WITH (compresstype = zstd, compresslevel = 1) DISTRIBUTED REPLICATED;
+INSERT INTO rf_fact_rep SELECT * FROM rf_fact_heap;
+ANALYZE rf_fact_rep;
+EXPLAIN (COSTS OFF)
+SELECT v.flag, (SELECT count(*) FROM rf_fact_rep f JOIN rf_dim_rep d ON f.k = d.k WHERE d.flag = 3 AND f.amt > v.flag * 10)
+FROM (SELECT DISTINCT flag FROM rf_dim_rep WHERE flag < 3) v ORDER BY 1;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Sort
+   Sort Key: rf_dim_rep.flag
+   ->  Gather Motion 1:1  (slice1; segments: 1)
+         ->  HashAggregate
+               Group Key: rf_dim_rep.flag
+               ->  Seq Scan on rf_dim_rep
+                     Filter: (flag < 3)
+               SubPlan 1
+                 ->  Aggregate
+                       ->  Result
+                             Filter: (f.amt > (rf_dim_rep.flag * 10))
+                             ->  Hash Join
+                                   Hash Cond: (f.k = d.k)
+                                   ->  Staged Seq Scan on rf_fact_rep f
+                                         Runtime Filter: k
+                                         Stages: k
+                                   ->  Hash
+                                         ->  Seq Scan on rf_dim_rep d
+                                               Filter: (flag = 3)
+ Optimizer: GPORCA
+(20 rows)
+
+SELECT rf_filters_built($$SELECT v.flag, (SELECT count(*) FROM rf_fact_rep f JOIN rf_dim_rep d ON f.k = d.k WHERE d.flag = 3 AND f.amt > v.flag * 10) FROM (SELECT DISTINCT flag FROM rf_dim_rep WHERE flag < 3) v ORDER BY 1$$) AS filters_built_once;
+ filters_built_once 
+--------------------
+                  1
+(1 row)
+
+SELECT rf_same($$SELECT md5(string_agg(flag::text || ':' || c::text, ',' ORDER BY flag)) FROM (SELECT v.flag, (SELECT count(*) FROM rf_fact_rep f JOIN rf_dim_rep d ON f.k = d.k WHERE d.flag = 3 AND f.amt > v.flag * 10) c FROM (SELECT DISTINCT flag FROM rf_dim_rep WHERE flag < 3) v) s$$) AS rescan;
  rescan 
 --------
  t
@@ -1236,7 +1332,7 @@ RESET optimizer;
 RESET whpg_runtime_filter_min_probe_rows;
 RESET search_path;
 DROP SCHEMA runtime_filter CASCADE;
-NOTICE:  drop cascades to 22 other objects
+NOTICE:  drop cascades to 25 other objects
 DETAIL:  drop cascades to function runtime_filter.rf_planned(text)
 drop cascades to function runtime_filter.rf_same(text)
 drop cascades to table runtime_filter.rf_dim
@@ -1246,6 +1342,8 @@ drop cascades to table runtime_filter.rf_fact_aoco
 drop cascades to table runtime_filter.rf_dim_arr
 drop cascades to table runtime_filter.rf_fact_arr
 drop cascades to table runtime_filter.rf_stale
+drop cascades to table runtime_filter.rf_dim_rep
+drop cascades to function runtime_filter.rf_filters_built(text)
 drop cascades to function runtime_filter.rf_nseq(integer,integer)
 drop cascades to operator runtime_filter.===(integer,integer)
 drop cascades to operator family runtime_filter.rf_nsfam for access method hash
@@ -1258,4 +1356,5 @@ drop cascades to table runtime_filter.rf_dim_amt
 drop cascades to table runtime_filter.rf_dim_mk
 drop cascades to table runtime_filter.rf_dim_mk_k
 drop cascades to table runtime_filter.rf_fact_nostats
+drop cascades to table runtime_filter.rf_fact_rep
 drop cascades to table runtime_filter.rf_fact_part

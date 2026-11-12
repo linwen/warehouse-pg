@@ -2382,12 +2382,15 @@ typedef struct HashJoinState
 
 	/*
 	 * WHPG: the exec Param this join sets to a runtime filter for the probe
-	 * scan (planrtfilter.c), or -1; the hash key the filter is over; and the
-	 * filter it points to, if built.
+	 * scan (planrtfilter.c), or -1; the hash key the filter is over; the
+	 * filter it points to, if built; and whether the table is built before
+	 * the first probe row is asked for (the probe is a Staged Scan the
+	 * filter leads; see ExecHashJoin).
 	 */
 	int			hj_rfParamId;
 	int			hj_rfKeyIdx;
 	struct varlena *hj_rfFilter;
+	bool		hj_rfBuildFirst;
 } HashJoinState;
 
 
