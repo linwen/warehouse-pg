@@ -335,51 +335,52 @@ Every query returned the same rows on and off; four (q64, q65, q71, q75)
 listed them in another order, two of those with no filter in the plan: tie
 order under `ORDER BY ... LIMIT`.
 
-**TPC-DS, scale factor 30**, release build (no assertions) with the Phase A
-fast path and the filters carried down join chains, GPORCA, the same schema
-(`store_sales` 86M rows in 221 partitions, an 11 GB database) and cluster.
-Each query ran four times in the order on, off, on, off and the second pair
-is compared: the first run of every query was also the first touch of its
-data after the load, so the first pair carries the cold read on the "on"
-side (q07's first on run took 5.9 s against 0.6 s warm). A query whose two
-off runs disagreed by more than a quarter, or whose warm on run came out
-slower than both off runs by that much, was run again alone and the second
-measurement kept (q11, q16, q18, q69, q81; q56, q88, q90 and q96 were
-re-timed after the rule that keeps a scan's Staged Scan ahead of a second
-filter). q23 and q95, the two largest spillers, were left out: q95 runs
-out of temporary space on this volume under both settings, q23 takes 100 s
-and gets no filter. 61 of the 97 queries got a filter. Warm pair: the 97
-queries 344.6 s off, 327.7 s on (-4.9%); the 61 with a filter 103.1 s and
-84.6 s (-17.9%); the 36 without one -- identical plans -- 241.5 s and
-243.1 s (+0.6%). Per query with a filter: median -7.6%, 40 queries more
-than 5% faster, 4 more than 5% slower; without a filter the median change
-is +0.2% and the spread -9%..+15%. Taking the minimum of the two runs per
-setting instead: -4.6% / -16.4%, median -7.0%, 38 faster and 4 slower.
-Before the filters were carried down join chains the same sweep had 55
-queries with a filter, at -9.8% for them and a median of -7.2%; the six
-queries that gained a filter and the eleven that gained more account for
-the difference (q16 -40% to -58%, q48 -8% to -40%, q19 -9% to -32%, q66 0
-to -30%, q72 -6% to -18%).
+**TPC-DS, scale factor 30**, release build (no assertions), GPORCA, the same
+schema (`store_sales` 86M rows in 221 partitions, an 11 GB database) and
+cluster, on the branch's final code. Each query ran five rounds of one run
+per setting, the two settings alternating within a round and the starting
+side alternating from one query to the next, so that neither setting owns
+the cold first touch of a query's data; the median of each setting's five
+runs is the measurement, and every run is kept in the log. q23 and q95, the
+two largest spillers, were left out: q95 runs out of temporary space on
+this volume under both settings, q23 takes 100 s and gets no filter. 63 of
+the 97 queries got a filter. By the medians: the 97 queries 354.8 s off,
+334.9 s on (-5.6%); the 63 with a filter 110.0 s and 85.6 s (-22.2%); the
+34 without one -- identical plans -- 244.8 s and 249.4 s (+1.9%). Per query
+with a filter: median -14.6%, 43 queries more than 5% faster, none more
+than 5% slower; without a filter the median change is -0.6% and the spread
+-9%..+19%, the noise band of this host (the five runs of one setting differ
+by a factor of 1.24 at the median, and by 14 for q27, whose first run was
+cold). Earlier sweeps of two runs per setting, on earlier commits of the
+branch, gave the queries with a filter -15% to -21% in total and medians of
+-8% to -18%, with two to four queries more than 5% slower each time, which
+the five-run medians show to have been noise.
 
-| query | filters | filter off (ms) | filter on (ms) | change |
+| query | filters | filter off, median (ms) | filter on, median (ms) | change |
 |---|---|---|---|---|
-| q16 | 3 | 3201 | 1350 | -58% |
-| q03 | `ss_item_sk` | 489 | 221 | -55% |
-| q94 | 3 | 1761 | 878 | -50% |
-| q63 | `ss_item_sk` | 519 | 269 | -48% |
-| q90 | 2 | 922 | 534 | -42% |
-| q84 | 3 | 230 | 134 | -42% |
-| q48 | 2 | 1231 | 737 | -40% |
-| q53 | `ss_item_sk` | 602 | 363 | -40% |
-| q96 | `ss_sold_time_sk` | 2130 | 1347 | -37% |
-| q07 | `ss_cdemo_sk` | 877 | 583 | -34% |
-| q88 | 8 | 12704 | 8358 | -34% |
-| q19 | 1 | 244 | 165 | -32% |
-| q26 | 1 | 507 | 346 | -32% |
-| q55 | `ss_item_sk` | 146 | 100 | -32% |
-| q27 | `ss_cdemo_sk` | 998 | 693 | -31% |
-| q66 | 4 | 1069 | 750 | -30% |
-| q72 | 2 | 13965 | 11440 | -18% |
+| q50 | `ss_ticket_number` (one key of two) | 3058 | 648 | -79% |
+| q03 | `ss_item_sk` | 504 | 204 | -60% |
+| q16 | 3 | 3444 | 1484 | -57% |
+| q94 | 3 | 1761 | 857 | -51% |
+| q84 | 3 | 237 | 125 | -47% |
+| q63 | `ss_item_sk` | 526 | 283 | -46% |
+| q90 | 2 | 945 | 520 | -45% |
+| q64 | 7 | 12153 | 7206 | -41% |
+| q53 | `ss_item_sk` | 602 | 364 | -40% |
+| q48 | 2 | 1204 | 737 | -39% |
+| q96 | `ss_sold_time_sk` | 2060 | 1268 | -38% |
+| q88 | 8 | 12283 | 7724 | -37% |
+| q07 | `ss_cdemo_sk` | 907 | 594 | -35% |
+| q17 | 5 | 1429 | 936 | -34% |
+| q19 | 1 | 248 | 166 | -33% |
+| q26 | 1 | 512 | 349 | -32% |
+| q55 | `ss_item_sk` | 145 | 99 | -32% |
+| q29 | 3 | 1170 | 824 | -30% |
+| q27 | `ss_cdemo_sk` | 1001 | 712 | -29% |
+| q66 | 4 | 1018 | 722 | -29% |
+| q21 | 1 | 138 | 104 | -25% |
+| q89 | 1 | 771 | 594 | -23% |
+| q72 | 2 | 12965 | 13326 | +3% |
 
 q03 shows what the fast path changes: `Dynamic Staged Seq Scan on
 store_sales ... Runtime Filter: ss_item_sk, Rows Removed by Filter: 6977374,
@@ -389,19 +390,17 @@ Phase B skips almost nothing, and the gain is Phase A's alone: 17M key
 values hashed and probed off the datum array, 18k rows assembled. At scale
 factor 10, with the clause evaluated row by row, the same query gained 25%.
 
-The slower ones are small and real: q21 (132 to 147 ms), q89 (750 to 819
-ms, both runs), q93 (67 to 72 ms) and q83 (297 to 314 ms, nine filters over
-small scans). q21 and q89 are alike: on q89, `Rows Removed by Filter:
-4910572` of 5.5M rows and `Stage Survivors: 0 of 0` -- the 3005 matching
-items (7.5% of `item`) put survivors in every block, the density check
-handed every partition back to the ordinary scan at once, and the clause
-ran as a per-row function call to save 4.9M probes of a 3005-row hash table
-that sits in L2 cache, a probe no filter can beat. The switch-off does not
-fire: the filter rejects 89% of the rows, useful by its own measure and
-useless by the clock. Every query returned the same rows on and off; q64,
-under `ORDER BY ... LIMIT 100`, listed different tied rows between two runs
-of the *same* setting in an earlier sweep (without the LIMIT its 582 result
-rows are identical on and off).
+No query with a filter is more than 5% slower by its median. The largest
+losses are q81 (607 to 635 ms; its five runs per setting range from 580 to
+907 ms), q06 (224 to 233 ms), q93 (73 to 76 ms) and q72 (12.97 to 13.33 s;
+runs 11.6-13.9 s against 11.8-14.1 s), each inside the spread of its own
+runs. q21 and q89, 8-11% slower in the earliest sweeps -- a filter that
+kept 11% of the rows had the Staged Scan's first-batch check hand every
+partition back to the ordinary scan, where staying was cheaper -- gain 25%
+and 23% since the two corrections to that check. Every query returned the
+same rows on and off; q24, q65, q71 and q73 list them in another order, and
+q64, under `ORDER BY ... LIMIT 100`, lists different tied rows (without the
+LIMIT its 582 result rows are identical on and off).
 
 **The fast path alone.** A 12M-row AOCO fact of 8 columns joined to a
 120k-key dimension, 1% of the fact's keys, clustered at the start of each
