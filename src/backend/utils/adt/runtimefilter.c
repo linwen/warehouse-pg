@@ -2,8 +2,9 @@
  *
  * runtimefilter.c
  *	  Runtime filters for hash joins: the filter (a split-block Bloom filter
- *	  over join-key hash values), the probe function the planner puts in the
- *	  probe scan's qual, and the helpers that recognize that clause.
+ *	  over join-key hash values), the probe of the clause the planner puts
+ *	  in the probe scan's qual (a RuntimeFilterExpr), and the helpers that
+ *	  recognize that clause.
  *
  * Once a hash join has built its hash table it knows exactly which join
  * keys the inner side holds. When the probe side's scan runs in the same
@@ -40,15 +41,12 @@
  */
 #include "postgres.h"
 
-#include "catalog/pg_type.h"
 #include "fmgr.h"
-#include "nodes/makefuncs.h"
+#include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
-#include "nodes/supportnodes.h"
 #include "parser/parse_coerce.h"
 #include "port/pg_bitutils.h"
 #include "utils/builtins.h"
-#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/regproc.h"
@@ -200,11 +198,11 @@ runtimefilter_merge(struct varlena *into, const struct varlena *other)
 
 /*
  * The filter a Param holds, or NULL if what it holds is not a filter the
- * hash join built -- a guard against an executor or planner fault, since SQL
- * cannot call the probe. NULL lets every row through, as a Param the join
- * has not set does: a filter only ever drops rows the join would drop, so
- * one that cannot be trusted is not an error, it is no filter. The Staged
- * Scan's fast path reads the Param the same way.
+ * hash join built -- a guard against an executor or planner fault, since
+ * only the planner writes the clause that reads it. NULL lets every row
+ * through, as a Param the join has not set does: a filter only ever drops
+ * rows the join would drop, so one that cannot be trusted is not an error,
+ * it is no filter. The Staged Scan's fast path reads the Param the same way.
  */
 struct varlena *
 runtimefilter_check(struct varlena *v)
@@ -223,233 +221,162 @@ runtimefilter_check(struct varlena *v)
 }
 
 /*
- * whpg_rf_match(filter internal, key anyelement, hashop oid, selectivity float8)
+ * The probe of a RuntimeFilterExpr (primnodes.h), the clause the planner
+ * puts in the probe scan's qual: true if the key may be in the filter. The
+ * executor compiles the node to a step of its own (EEOP_RUNTIME_FILTER,
+ * execExpr.c) whose state this is; the steps before it leave the key in the
+ * state, and the clause rests on no catalog entry.
  *
- * Not callable from SQL: the filter argument is of type internal, which no
- * SQL expression yields, so the only caller is the clause the planner builds
- * (runtimefilter_make_clause()), its filter the Param a hash join sets.
- *
- * True if the key may be in the filter. A NULL filter -- none was built, or
- * it was dropped -- accepts every row. A NULL key is rejected when the hash
- * operator is strict, since the join never matches it then; a non-strict
- * operator hashes it as 0, as ExecHashGetHashValue() does (the planner gives
- * such a join no filter; this keeps the function true to the join). A filter
- * that turns out to pass nearly every row is switched off for the rest of
- * the query (runtimefilter_probe_count() in runtimefilter.h). 'hashop' is
- * the join's hash operator, whose left-hand operand is the key: the key is
- * hashed with that operator's left-hand hash support function, exactly as
+ * A NULL filter -- none was built, or it was dropped -- accepts every row. A
+ * NULL key is rejected when the hash operator is strict, since the join
+ * never matches it then; a non-strict operator hashes it as 0, as
+ * ExecHashGetHashValue() does (the planner gives such a join no filter; this
+ * keeps the probe true to the join). A filter that turns out to pass nearly
+ * every row is switched off for the rest of the query
+ * (runtimefilter_probe_count() in runtimefilter.h). The key is hashed with
+ * the hash operator's left-hand hash support function, exactly as
  * ExecHashTableCreate() hashes the probe side, looked up once per plan node.
- * The selectivity argument is read only by the planner, through the support
- * function below.
  *
- * The function cannot fail. Its arguments are checked once per plan node,
- * as guards against a planner or executor fault (no caller but the planner's
- * clause reaches them), and a clause that fails a check lets every row
- * through from then on: a filter only ever drops rows the join would drop,
- * so a clause that cannot be trusted is no filter, not an error. The fault
- * is logged, once per plan node.
+ * The probe cannot fail. The node is checked once per plan node, as a guard
+ * against a planner or executor fault (only the planner writes one), and a
+ * clause that fails a check lets every row through from then on: a filter
+ * only ever drops rows the join would drop, so a clause that cannot be
+ * trusted is no filter, not an error. The fault is logged, once per plan
+ * node.
  */
-typedef struct RfMatchCache
-{
-	FmgrInfo	hashfn;
-	bool		opStrict;		/* does the hash operator reject NULL? */
-	bool		unusable;		/* a check failed: every row passes */
-} RfMatchCache;
-
 static void
-rf_match_give_up(RfMatchCache *cache, const char *why)
+rf_probe_give_up(RuntimeFilterProbeState *probe, const char *why)
 {
-	cache->unusable = true;
+	probe->unusable = true;
 	ereport(LOG,
 			(errmsg("runtime filter ignored: %s", why)));
 }
 
-Datum
-whpg_rf_match(PG_FUNCTION_ARGS)
+RuntimeFilterProbeState *
+runtimefilter_probe_init(const RuntimeFilterExpr *rfexpr)
 {
-	RfMatchCache *cache = (RfMatchCache *) fcinfo->flinfo->fn_extra;
+	RuntimeFilterProbeState *probe;
+	Oid			keytype = exprType((Node *) rfexpr->key);
+	Oid			lefttype;
+	Oid			righttype;
+	Oid			lhsproc;
+	Oid			rhsproc;
+
+	probe = (RuntimeFilterProbeState *) palloc0(sizeof(RuntimeFilterProbeState));
+	probe->paramid = rfexpr->paramid;
+	probe->collation = rfexpr->collation;
+
+	/*
+	 * The key must be what the operator's left-hand hash function expects,
+	 * which is the operator's left-hand operand type (a date is hashed by
+	 * hashint4, so the key's own type would be the wrong thing to compare
+	 * with), and one the operator hashes (op_hashjoinable(): an array's
+	 * elements need a hash function; the planner pass makes this same test,
+	 * planrtfilter.c). Only a hash operator's own support function is ever
+	 * called here.
+	 */
+	if (!OidIsValid(rfexpr->hashop))
+		rf_probe_give_up(probe, "the clause names no hash operator");
+	else if (!OidIsValid(keytype) ||
+			 !op_hashjoinable(rfexpr->hashop, keytype) ||
+			 !get_op_hash_functions(rfexpr->hashop, &lhsproc, &rhsproc))
+		rf_probe_give_up(probe,
+						 psprintf("operator %s is not hashable for a key of type %s",
+								  format_operator(rfexpr->hashop),
+								  OidIsValid(keytype) ?
+								  format_type_be(keytype) : "unknown"));
+	else
+	{
+		op_input_types(rfexpr->hashop, &lefttype, &righttype);
+		if (!IsBinaryCoercible(keytype, lefttype))
+			rf_probe_give_up(probe,
+							 psprintf("operator %s does not take the key type %s",
+									  format_operator(rfexpr->hashop),
+									  format_type_be(keytype)));
+		else
+		{
+			fmgr_info(lhsproc, &probe->hashfn);
+			probe->opstrict = op_strict(rfexpr->hashop);
+		}
+	}
+	return probe;
+}
+
+bool
+runtimefilter_probe(RuntimeFilterProbeState *probe, ExprContext *econtext)
+{
+	ParamExecData *prm;
 	RuntimeFilter *f;
 	uint32		hashvalue;
 	bool		result;
 
-	if (cache == NULL)
-	{
-		Oid			keytype = get_fn_expr_argtype(fcinfo->flinfo, 1);
-		Oid			hashop;
-		Oid			lefttype;
-		Oid			righttype;
-		Oid			lhsproc;
-		Oid			rhsproc;
+	/* a clause not to be trusted, or an ExprContext without the Params */
+	if (probe->unusable || econtext->ecxt_param_exec_vals == NULL)
+		return true;
 
-		cache = (RfMatchCache *)
-			MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(RfMatchCache));
-		fcinfo->flinfo->fn_extra = cache;
-
-		/*
-		 * The operator is looked up once per plan node, so it has to be the
-		 * same on every row: the planner passes a Const.
-		 *
-		 * The key must be what the operator's left-hand hash function
-		 * expects, which is the operator's left-hand operand type (a date is
-		 * hashed by hashint4, so the function's own argument type would be
-		 * the wrong thing to compare with), and one the operator hashes
-		 * (op_hashjoinable(): an array's elements need a hash function; the
-		 * planner pass makes this same test, planrtfilter.c). Only a hash
-		 * operator's own support function is ever called here.
-		 *
-		 * The function is not marked leakproof; nothing needs the mark --
-		 * the clause the planner makes cannot fail, its filter being a Param
-		 * the join sets, and the Staged Scan knows it by that Param
-		 * (stagedscan_clause_can_fail()).
-		 */
-		if (PG_ARGISNULL(2) || !get_fn_expr_arg_stable(fcinfo->flinfo, 2))
-			rf_match_give_up(cache, "the hash operator is not a constant");
-		else
-		{
-			hashop = PG_GETARG_OID(2);
-			if (!OidIsValid(keytype) || !op_hashjoinable(hashop, keytype) ||
-				!get_op_hash_functions(hashop, &lhsproc, &rhsproc))
-				rf_match_give_up(cache,
-								 psprintf("operator %s is not hashable for a key of type %s",
-										  format_operator(hashop),
-										  OidIsValid(keytype) ?
-										  format_type_be(keytype) : "unknown"));
-			else
-			{
-				op_input_types(hashop, &lefttype, &righttype);
-				if (!IsBinaryCoercible(keytype, lefttype))
-					rf_match_give_up(cache,
-									 psprintf("operator %s does not take the key type %s",
-											  format_operator(hashop),
-											  format_type_be(keytype)));
-				else
-				{
-					fmgr_info_cxt(lhsproc, &cache->hashfn, fcinfo->flinfo->fn_mcxt);
-					cache->opStrict = op_strict(hashop);
-				}
-			}
-		}
-	}
-
-	/* no filter (none built, or dropped), or a clause not to be trusted */
-	if (cache->unusable || PG_ARGISNULL(0))
-		PG_RETURN_BOOL(true);
+	/* no filter (none built, or dropped) */
+	prm = &econtext->ecxt_param_exec_vals[probe->paramid];
+	if (prm->isnull)
+		return true;
 
 	/* a strict operator never matches a NULL key: the join drops the row */
-	if (PG_ARGISNULL(1) && cache->opStrict)
-		PG_RETURN_BOOL(false);
+	if (probe->keynull && probe->opstrict)
+		return false;
 
-	/* an internal-typed argument: the pointer the hash join published */
-	f = (RuntimeFilter *) runtimefilter_check((struct varlena *) PG_GETARG_POINTER(0));
+	/* the pointer the hash join published */
+	f = (RuntimeFilter *) runtimefilter_check((struct varlena *) DatumGetPointer(prm->value));
 	if (f == NULL)
 	{
-		rf_match_give_up(cache, "the parameter does not hold a filter");
-		PG_RETURN_BOOL(true);
+		rf_probe_give_up(probe, "the parameter does not hold a filter");
+		return true;
 	}
 
 	/* a filter that has shown itself useless lets the rows through */
 	if (f->disabled)
-		PG_RETURN_BOOL(true);
+		return true;
 
 	/* a non-strict operator's NULL key hashes as 0, as in the join */
-	if (PG_ARGISNULL(1))
+	if (probe->keynull)
 		hashvalue = 0;
 	else
-		hashvalue = DatumGetUInt32(FunctionCall1Coll(&cache->hashfn,
-													 PG_GET_COLLATION(),
-													 PG_GETARG_DATUM(1)));
+		hashvalue = DatumGetUInt32(FunctionCall1Coll(&probe->hashfn,
+													 probe->collation,
+													 probe->keyvalue));
 	result = runtimefilter_contains(f, hashvalue);
 	runtimefilter_probe_count(f, result);
 
-	PG_RETURN_BOOL(result);
+	return result;
 }
 
 /*
- * Planner support for whpg_rf_match(): its selectivity is the planner's
- * estimate of the probe rows that have a match, carried in the fourth
- * argument so that the cost model (the Staged Scan's in particular) can
- * weigh the clause like any other.
- */
-Datum
-whpg_rf_match_support(PG_FUNCTION_ARGS)
-{
-	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
-
-	if (IsA(rawreq, SupportRequestSelectivity))
-	{
-		SupportRequestSelectivity *req = (SupportRequestSelectivity *) rawreq;
-
-		if (list_length(req->args) == 4)
-		{
-			Node	   *selarg = (Node *) lfourth(req->args);
-
-			if (IsA(selarg, Const) && !((Const *) selarg)->constisnull)
-			{
-				double		sel = DatumGetFloat8(((Const *) selarg)->constvalue);
-
-				req->selectivity = Max(0.0, Min(1.0, sel));
-				PG_RETURN_POINTER(req);
-			}
-		}
-	}
-	PG_RETURN_POINTER(NULL);
-}
-
-/*
- * Build the clause: whpg_rf_match($paramid, key, hashop, selectivity).
- * 'hashop' is the join's hash operator, with the key as its left-hand
- * operand; 'collation' is the hash clause's input collation, which the hash
- * function is called with on both sides of the join.
+ * Build the clause: a RuntimeFilterExpr over the Param 'paramid', the key,
+ * the join's hash operator ('hashop', with the key as its left-hand operand)
+ * and the hash clause's input collation, which the hash function is called
+ * with on both sides of the join.
  */
 Expr *
 runtimefilter_make_clause(int paramid, Expr *key, Oid hashop,
 						  Oid collation, double selectivity)
 {
-	Param	   *param = makeNode(Param);
-	Const	   *opConst;
-	Const	   *selConst;
+	RuntimeFilterExpr *rfexpr = makeNode(RuntimeFilterExpr);
 
-	param->paramkind = PARAM_EXEC;
-	param->paramid = paramid;
-	param->paramtype = INTERNALOID;
-	param->paramtypmod = -1;
-	param->paramcollid = InvalidOid;
-	param->location = -1;
-
-	opConst = makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
-						ObjectIdGetDatum(hashop), false, true);
-	selConst = makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
-						 Float8GetDatum(selectivity), false, FLOAT8PASSBYVAL);
-
-	return (Expr *) makeFuncExpr(F_WHPG_RF_MATCH, BOOLOID,
-								 list_make4(param, key, opConst, selConst),
-								 InvalidOid, collation, COERCE_EXPLICIT_CALL);
+	rfexpr->paramid = paramid;
+	rfexpr->key = key;
+	rfexpr->hashop = hashop;
+	rfexpr->collation = collation;
+	rfexpr->selectivity = selectivity;
+	return (Expr *) rfexpr;
 }
 
 /*
- * Is this the clause the planner builds? A call of whpg_rf_match() whose
- * filter argument is an exec Param of type internal. Only the planner can
- * write such a call: no SQL expression yields a value of type internal -- a
- * scalar subquery's Param, a prepared statement's $1, a column are all of
- * SQL types -- so the parser never resolves whpg_rf_match() for a query, and
- * a Staged Scan may take the Param of a clause this accepts for one a hash
- * join sets.
+ * Is this the clause the planner builds? Only the planner writes a
+ * RuntimeFilterExpr -- SQL has no syntax for one -- so a Staged Scan may
+ * take the Param of a clause this accepts for one a hash join sets.
  */
 bool
 runtimefilter_is_clause(const Node *node)
 {
-	const FuncExpr *fe;
-	const Node *filter;
-
-	if (node == NULL || !IsA(node, FuncExpr))
-		return false;
-	fe = (const FuncExpr *) node;
-	if (fe->funcid != F_WHPG_RF_MATCH || list_length(fe->args) != 4)
-		return false;
-	filter = (const Node *) linitial(fe->args);
-	return IsA(filter, Param) &&
-		((const Param *) filter)->paramkind == PARAM_EXEC &&
-		((const Param *) filter)->paramtype == INTERNALOID;
+	return node != NULL && IsA(node, RuntimeFilterExpr);
 }
 
 /* the key expression of a clause runtimefilter_is_clause() accepted */
@@ -457,7 +384,7 @@ Node *
 runtimefilter_clause_key(const Node *clause)
 {
 	Assert(runtimefilter_is_clause(clause));
-	return (Node *) lsecond(((const FuncExpr *) clause)->args);
+	return (Node *) ((const RuntimeFilterExpr *) clause)->key;
 }
 
 /* split a qual into its runtime filter clauses and the rest, order kept */

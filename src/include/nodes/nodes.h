@@ -258,6 +258,7 @@ typedef enum NodeTag
 	T_RowIdExpr,
 	T_DistributedBy,
 	T_DMLActionExpr,
+	T_RuntimeFilterExpr,		/* WHPG: a hash join's runtime filter probe */
 
 	/*
 	 * TAGS FOR EXPRESSION STATE NODES (execnodes.h)

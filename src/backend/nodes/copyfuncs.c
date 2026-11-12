@@ -3602,6 +3602,20 @@ _copyDMLActionExpr(const DMLActionExpr *from)
 	return newnode;
 }
 
+static RuntimeFilterExpr *
+_copyRuntimeFilterExpr(const RuntimeFilterExpr *from)
+{
+	RuntimeFilterExpr *newnode = makeNode(RuntimeFilterExpr);
+
+	COPY_SCALAR_FIELD(paramid);
+	COPY_NODE_FIELD(key);
+	COPY_SCALAR_FIELD(hashop);
+	COPY_SCALAR_FIELD(collation);
+	COPY_SCALAR_FIELD(selectivity);
+
+	return newnode;
+}
+
 static RoleSpec *
 _copyRoleSpec(const RoleSpec *from)
 {
@@ -6775,6 +6789,9 @@ copyObjectImpl(const void *from)
 			break;
 		case T_DMLActionExpr:
 			retval = _copyDMLActionExpr(from);
+			break;
+		case T_RuntimeFilterExpr:
+			retval = _copyRuntimeFilterExpr(from);
 			break;
 		case T_RangeTblEntry:
 			retval = _copyRangeTblEntry(from);

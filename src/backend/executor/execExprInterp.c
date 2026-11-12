@@ -78,6 +78,7 @@
 
 #include "cdb/cdbvars.h"
 #include "utils/fmgroids.h"
+#include "utils/runtimefilter.h"
 
 
 /*
@@ -404,6 +405,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_AGG_PLAIN_TRANS,
 		&&CASE_EEOP_AGG_ORDERED_TRANS_DATUM,
 		&&CASE_EEOP_AGG_ORDERED_TRANS_TUPLE,
+		&&CASE_EEOP_RUNTIME_FILTER,
 		&&CASE_EEOP_LAST
 	};
 
@@ -1830,6 +1832,15 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		/* WHPG: a hash join's runtime filter probe */
+		EEO_CASE(EEOP_RUNTIME_FILTER)
+		{
+			/* out of line implementation: too large */
+			ExecEvalRuntimeFilter(state, op, econtext);
+
+			EEO_NEXT();
+		}
+
 		EEO_CASE(EEOP_LAST)
 		{
 			/* unreachable */
@@ -2408,6 +2419,18 @@ ExecEvalParamExec(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 	}
 	*op->resvalue = prm->value;
 	*op->resnull = prm->isnull;
+}
+
+/*
+ * WHPG: evaluate a hash join's runtime filter probe (RuntimeFilterExpr). The
+ * steps before this one left the key in the probe's state (execExpr.c).
+ */
+void
+ExecEvalRuntimeFilter(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
+{
+	*op->resvalue = BoolGetDatum(runtimefilter_probe(op->d.rtfilter.probe,
+													 econtext));
+	*op->resnull = false;
 }
 
 /*

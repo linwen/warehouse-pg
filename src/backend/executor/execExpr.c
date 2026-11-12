@@ -52,6 +52,7 @@
 #include "catalog/pg_collation.h"
 #include "cdb/cdbvars.h"
 #include "utils/pg_locale.h"
+#include "utils/runtimefilter.h"
 
 
 typedef struct LastAttnumInfo
@@ -762,6 +763,25 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				scratch.d.constval.value = con->constvalue;
 				scratch.d.constval.isnull = con->constisnull;
 
+				ExprEvalPushStep(state, &scratch);
+				break;
+			}
+
+		case T_RuntimeFilterExpr:
+			{
+				/*
+				 * WHPG: a hash join's runtime filter probe. The key is
+				 * evaluated into the probe's state; one step then tests it
+				 * against the filter the Param holds (runtimefilter.c).
+				 */
+				RuntimeFilterExpr *rfexpr = (RuntimeFilterExpr *) node;
+				RuntimeFilterProbeState *probe = runtimefilter_probe_init(rfexpr);
+
+				ExecInitExprRec(rfexpr->key, state,
+								&probe->keyvalue, &probe->keynull);
+
+				scratch.opcode = EEOP_RUNTIME_FILTER;
+				scratch.d.rtfilter.probe = probe;
 				ExprEvalPushStep(state, &scratch);
 				break;
 			}

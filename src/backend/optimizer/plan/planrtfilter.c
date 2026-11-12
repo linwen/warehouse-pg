@@ -13,9 +13,9 @@
  *	 - allocates an exec Param, which the join sets to the filter once its
  *	   hash table is built (nodeHashjoin.c) and before it reads a single
  *	   probe row;
- *	 - puts whpg_rf_match($param, column, hashop, selectivity) after the
- *	   scan's own clauses (runtimefilter.c), so the scan drops rows whose
- *	   key cannot be in the hash table;
+ *	 - puts a RuntimeFilterExpr over that Param, the column and the join's
+ *	   hash operator after the scan's own clauses (runtimefilter.c), so the
+ *	   scan drops rows whose key cannot be in the hash table;
  *	 - on an AOCO table, decides the Staged Scan again with that clause in
  *	   the predicate, so that the filter column can lead Phase A and the
  *	   rows the filter drops never have their other columns decompressed.
@@ -246,8 +246,8 @@ rf_find_probe_scan(Plan *outer, Node *key, SeqScan **scan, Node **scanKey,
 			 * A relabel to a polymorphic type names no type to hash by:
 			 * GPORCA writes an array key as (karr)::anyarray, and the
 			 * probe looks its hash function up by the key's type
-			 * (whpg_rf_match()). The column's own type is what the join
-			 * hashes; the key is taken down to it.
+			 * (runtimefilter_probe_init()). The column's own type is what
+			 * the join hashes; the key is taken down to it.
 			 */
 			while (IsA(key, RelabelType) &&
 				   IsPolymorphicType(((RelabelType *) key)->resulttype))
@@ -282,14 +282,12 @@ rf_find_probe_scan(Plan *outer, Node *key, SeqScan **scan, Node **scanKey,
 	}
 }
 
-/* The survivor estimate a filter clause carries (its fourth argument). */
+/* The survivor estimate a filter clause carries. */
 static double
 rf_clause_selectivity(Node *clause)
 {
-	Const	   *c = (Const *) lfourth(((FuncExpr *) clause)->args);
-
-	Assert(IsA(c, Const) && !c->constisnull);
-	return DatumGetFloat8(c->constvalue);
+	Assert(runtimefilter_is_clause(clause));
+	return ((RuntimeFilterExpr *) clause)->selectivity;
 }
 
 /*
@@ -591,8 +589,9 @@ rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 			 *
 			 * The key's type must be one the operator hashes -- an array
 			 * key is hashable only if its elements are (op_hashjoinable()).
-			 * It is the test whpg_rf_match() makes on the clause, made
-			 * here so that the two cannot disagree.
+			 * It is the test the executor's probe makes on the clause
+			 * (runtimefilter_probe_init()), made here so that the two
+			 * cannot disagree.
 			 *
 			 * The filter rejects a NULL probe key, as the join does -- but
 			 * the join only does so for a strict hash operator

@@ -14,7 +14,7 @@ Code:
 | piece | file |
 |---|---|
 | the filter: a split-block Bloom filter in a bytea, build/insert/finish/probe | `src/backend/utils/adt/runtimefilter.c` |
-| `whpg_rf_match()`, the probe the planner puts in the scan's qual (not callable from SQL: its filter argument is of type `internal`), and its selectivity support function | same file; `pg_proc.dat` |
+| the probe: `RuntimeFilterExpr` (primnodes.h), the clause the planner puts in the scan's qual, which the executor compiles to a step of its own (`EEOP_RUNTIME_FILTER`); no catalog entry | same file; `execExpr.c`, `execExprInterp.c` |
 | the planner pass: which joins, which scan, the Param, the clause | `src/backend/optimizer/plan/planrtfilter.c` |
 | hooks: after `SS_finalize_plan()` for the Postgres planner, after the Staged Scan pass for GPORCA | `planner.c` (`standard_planner`), `orca.c` (`optimize_query`) |
 | building the filter while the table is built | `nodeHash.c` (`MultiExecPrivateHash`) |
@@ -37,10 +37,11 @@ Append or anything else. If that is a SeqScan or DynamicSeqScan of a base
 relation and the join's outer hash key is a column of it, carried down the
 outer side unchanged, the pass
 
-- allocates an exec Param (`paramExecTypes`, type bytea),
-- puts `whpg_rf_match($param, column, hashop, selectivity)` after the
-  scan's own clauses -- they are cheaper and already in cost order, so the
-  filter sees only the rows they pass,
+- allocates an exec Param (`paramExecTypes`, type internal),
+- puts a `RuntimeFilterExpr` over that Param, the column, the join's hash
+  operator and the survivor estimate after the scan's own clauses -- they
+  are cheaper and already in cost order, so the filter sees only the rows
+  they pass,
 - records the Param on the join (`rf_paramids`),
 - and, for an AOCO table, decides the Staged Scan again with the new clause
   in the predicate (`stagedscan_decide_plan_scan()`), so that the join key
@@ -113,9 +114,9 @@ support function otherwise -- and looked up in the filter, with no tuple
 formed and no `ExecQual()`. The filter is bound from the Param once per block
 (`stagedscan_rf_bind()`), and the switch-off below counts those rows too. A
 block the fast path cannot take (NULLs, RLE/delta layout) goes row by row
-through `whpg_rf_match()` as before.
+through the qual's probe as before.
 
-`whpg_rf_match()` returns true for a NULL filter (not built yet, dropped as
+The probe returns true for a NULL filter (not built yet, dropped as
 too full, a Parallel Hash) and false for a NULL key: a strict hash operator
 never matches a NULL, and the join types that get a filter drop such rows.
 A join over a non-strict hash operator, which hashes NULL as 0 and may match
@@ -130,18 +131,22 @@ tally is kept in the filter itself (`RuntimeFilter.seen`, `.passed`,
 Staged Scan fast path's, each partition's scan under a dynamic scan -- counts
 into the same tally and gives it up together, rather than each starting the
 65536 rows over; a rebuilt hash table brings a new filter, judged afresh.
-The function cannot be called from SQL: its filter argument is of type
-`internal`, which no SQL expression yields (a scalar subquery, a prepared
-statement's parameter, a column are all of SQL types), so the parser never
-resolves it and the only caller is the planner's clause. It still checks,
-once per plan node, that the Param holds a filter, that the operator is a
-constant hash operator that takes the key's type and hashes it (an array
-key needs a hash function for its elements, `op_hashjoinable()`), as guards
-against a planner or executor fault -- and a clause that fails a check lets
-every row through from then on, with a LOG line, rather than fail the query:
-a filter only ever drops rows the join would drop, so an untrusted one is no
-filter, not an error. The planner pass makes the same tests before it
-writes a clause, so the guards should never fire.
+The clause is a node of its own, `RuntimeFilterExpr` (primnodes.h), which
+only the planner writes: SQL has no syntax for it, and it rests on no
+catalog entry -- no `pg_proc` row, no catalog version change -- so a minor
+release can carry it onto an existing cluster. The executor compiles it to
+one step (`EEOP_RUNTIME_FILTER`, `execExpr.c`) that evaluates the key and
+probes the filter without going through fmgr; the JIT calls the same C
+function (`ExecEvalRuntimeFilter()`). The step's setup
+(`runtimefilter_probe_init()`) checks, once per plan node, that the hash
+operator takes the key's type and hashes it (an array key needs a hash
+function for its elements, `op_hashjoinable()`), and the probe checks that
+the Param holds a filter, as guards against a planner or executor fault --
+and a clause that fails a check lets every row through from then on, with a
+LOG line, rather than fail the query: a filter only ever drops rows the join
+would drop, so an untrusted one is no filter, not an error. The planner pass
+makes the same tests before it writes a clause, so the guards should never
+fire.
 
 **The filter** is a split-block Bloom filter: 256-bit blocks of eight 32-bit
 words, one bit per word, so a probe touches a single cache line; it is fed
@@ -170,10 +175,8 @@ operator never matches it, and a join over a non-strict one gets none. The
 Staged Scan's rules carry over: the clause cannot fail -- its filter is a
 Param the join sets to NULL or to a filter it built, its operator and key
 type paired by the planner -- so it may be decided at any stage, ahead of
-clauses that can fail; `stagedscan_clause_can_fail()` knows it by that
-Param, which only the planner can write (`runtimefilter_is_clause()`: an
-exec Param of type `internal`). The function is not marked leakproof;
-nothing depends on the mark.
+clauses that can fail; `stagedscan_clause_can_fail()` knows it by its node
+type, which only the planner writes (`runtimefilter_is_clause()`).
 
 Passing a lower join on the way to the scan is safe for the same reason. A
 probe row the filter drops before an inner, left, semi or anti join (the

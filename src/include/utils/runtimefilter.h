@@ -17,6 +17,7 @@
 #define RUNTIMEFILTER_H
 
 #include "access/hash.h"
+#include "fmgr.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
 #include "utils/palloc.h"
@@ -49,7 +50,8 @@ extern struct varlena *runtimefilter_check(struct varlena *v);
 /*
  * The filter itself, as the bytea holds it, and the probe -- inline, so that
  * the AOCO Staged Scan can test a block's raw datum array against it without
- * going through fmgr (aocs_stagedscan.c), exactly as whpg_rf_match() does.
+ * going through fmgr (aocs_stagedscan.c), exactly as the qual's probe does
+ * (runtimefilter_probe()).
  *
  * A split-block Bloom filter: 256-bit blocks of eight 32-bit words, one bit
  * set per word (k = 8), so a probe touches one cache line. The 32-bit hash
@@ -171,15 +173,36 @@ runtimefilter_probe_count(RuntimeFilter *f, bool passed)
 }
 
 /*
- * The clause the planner puts in the probe scan's qual: a call of
- * whpg_rf_match(filter, key, hashop, selectivity) whose first argument is
- * the exec Param the join sets (planrtfilter.c).
+ * The clause the planner puts in the probe scan's qual: a RuntimeFilterExpr
+ * (primnodes.h) over the exec Param the join sets (planrtfilter.c).
  */
 extern Expr *runtimefilter_make_clause(int paramid, Expr *key, Oid hashop,
 									   Oid collation, double selectivity);
 extern bool runtimefilter_is_clause(const Node *node);
 extern Node *runtimefilter_clause_key(const Node *clause);
 extern void runtimefilter_split_qual(List *qual, List **filters, List **rest);
+
+/*
+ * The executor's state for one RuntimeFilterExpr. execExpr.c compiles the
+ * node to an EEOP_RUNTIME_FILTER step that owns one: the steps before it
+ * leave the key in keyvalue/keynull, and runtimefilter_probe() tests it
+ * against the filter the Param holds.
+ */
+typedef struct RuntimeFilterProbeState
+{
+	int			paramid;		/* the Param that holds the filter */
+	Datum		keyvalue;		/* the key, evaluated by the steps before */
+	bool		keynull;
+	FmgrInfo	hashfn;			/* the hash operator's left-hand hash function */
+	Oid			collation;
+	bool		opstrict;		/* does the hash operator reject NULL? */
+	bool		unusable;		/* a check failed: every row passes */
+} RuntimeFilterProbeState;
+
+struct ExprContext;
+extern RuntimeFilterProbeState *runtimefilter_probe_init(const RuntimeFilterExpr *rfexpr);
+extern bool runtimefilter_probe(RuntimeFilterProbeState *probe,
+								struct ExprContext *econtext);
 
 /*
  * Why the planner gave a hash join no filter (HashJoin.rf_decline), for

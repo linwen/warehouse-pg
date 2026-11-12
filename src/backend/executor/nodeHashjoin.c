@@ -170,7 +170,7 @@ static inline void SaveWorkFileSetStatsInfo(HashJoinTable hashtable);
  * WHPG: the runtime filter for the probe side (planrtfilter.c).
  *
  * The planner gave this join an exec Param that the probe scan's qual reads
- * through whpg_rf_match(). While the Hash node builds the table it inserts
+ * through a RuntimeFilterExpr. While the Hash node builds the table it inserts
  * every hash value into a filter (nodeHash.c); once the table is complete
  * the join points the Param at the finished filter, before it reads a
  * single probe row. A NULL Param means "no filter" -- not built yet, dropped

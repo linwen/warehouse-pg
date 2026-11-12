@@ -4216,6 +4216,18 @@ _outDMLActionExpr(StringInfo str, const DMLActionExpr *node)
 }
 
 static void
+_outRuntimeFilterExpr(StringInfo str, const RuntimeFilterExpr *node)
+{
+	WRITE_NODE_TYPE("RUNTIMEFILTEREXPR");
+
+	WRITE_INT_FIELD(paramid);
+	WRITE_NODE_FIELD(key);
+	WRITE_OID_FIELD(hashop);
+	WRITE_OID_FIELD(collation);
+	WRITE_FLOAT_FIELD(selectivity, "%.6g");
+}
+
+static void
 _outTriggerTransition(StringInfo str, const TriggerTransition *node)
 {
 	WRITE_NODE_TYPE("TRIGGERTRANSITION");
@@ -6514,6 +6526,9 @@ outNode(StringInfo str, const void *obj)
 
 			case T_DMLActionExpr:
 				_outDMLActionExpr(str, obj);
+				break;
+			case T_RuntimeFilterExpr:
+				_outRuntimeFilterExpr(str, obj);
 				break;
 
 			case T_CreateTrigStmt:

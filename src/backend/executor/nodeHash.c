@@ -150,7 +150,7 @@ MultiExecHash(HashState *node)
  * is over one hash key (HashJoin.rf_keyidx). For a join on a single key that
  * is the hash value the table takes, which is that key's. For a join on
  * several the chosen key is hashed by itself -- as the probe scan's clause
- * hashes its column (whpg_rf_match()) -- which costs this one more
+ * hashes its column (runtimefilter_probe()) -- which costs this one more
  * evaluation of the key per inner row. A NULL key is left out: the planner
  * takes only strict operators (planrtfilter.c), so no probe row matches it.
  * The tuple is econtext->ecxt_outertuple, as for ExecHashGetHashValue().

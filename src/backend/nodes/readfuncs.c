@@ -1474,6 +1474,23 @@ _readFuncExpr(void)
 }
 
 /*
+ * _readRuntimeFilterExpr (WHPG)
+ */
+static RuntimeFilterExpr *
+_readRuntimeFilterExpr(void)
+{
+	READ_LOCALS(RuntimeFilterExpr);
+
+	READ_INT_FIELD(paramid);
+	READ_NODE_FIELD(key);
+	READ_OID_FIELD(hashop);
+	READ_OID_FIELD(collation);
+	READ_FLOAT_FIELD(selectivity);
+
+	READ_DONE();
+}
+
+/*
  * _readNamedArgExpr
  */
 static NamedArgExpr *
@@ -4558,6 +4575,8 @@ parseNodeString(void)
 		return_value = _readSubscriptingRef();
 	else if (MATCH("FUNCEXPR", 8))
 		return_value = _readFuncExpr();
+	else if (MATCH("RUNTIMEFILTEREXPR", 17))
+		return_value = _readRuntimeFilterExpr();
 	else if (MATCH("NAMEDARGEXPR", 12))
 		return_value = _readNamedArgExpr();
 	else if (MATCH("OPEXPR", 6))

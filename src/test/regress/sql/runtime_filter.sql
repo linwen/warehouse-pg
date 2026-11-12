@@ -1,8 +1,8 @@
 -- Runtime filters for hash joins.
 --
 -- Once a hash join has built its hash table, it hands the probe side's scan a
--- Bloom filter over the join keys (an exec Param read by a whpg_rf_match()
--- clause the planner put in the scan's qual), and the scan drops the rows that
+-- Bloom filter over the join keys (an exec Param read by a probe clause the
+-- planner put in the scan's qual), and the scan drops the rows that
 -- cannot have a match before it assembles them. On an AOCO table the clause
 -- leads a Staged Scan, so those rows' other columns are never decompressed.
 -- Only joins whose probe side is a scan in the same slice get one: no Motion
@@ -187,15 +187,6 @@ FETCH 3 FROM rf_cur;
 FETCH 3 FROM rf_cur;
 CLOSE rf_cur;
 COMMIT;
-
--- The probe function cannot be called from SQL: its filter argument is of
--- type internal, which no SQL expression yields, so the parser never
--- resolves it -- neither with a literal nor with a scalar subquery, whose
--- Param is of a SQL type. The clause can only come from the planner, and a
--- Staged Scan may trust its Param to hold a filter a hash join built.
-SELECT whpg_rf_match(NULL::bytea, 1, '=(integer,integer)'::regoperator::oid, 0.5);
-SELECT count(*) FROM rf_fact_aoco f WHERE f.amt < 100 AND whpg_rf_match((SELECT '\x00'::bytea), f.k, '=(integer,integer)'::regoperator::oid, 0.000001);
-SELECT proname, proargtypes::regtype[] FROM pg_proc WHERE proname = 'whpg_rf_match';
 
 -- A hash join over a non-strict hash operator matches NULL keys (it hashes
 -- them as 0, ExecHashGetHashValue()), which the filter would reject: such a

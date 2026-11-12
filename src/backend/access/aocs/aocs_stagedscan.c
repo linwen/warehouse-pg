@@ -337,12 +337,11 @@ stagedscan_contains_sysattr(Node *node)
  * too: whether it fails does not depend on the row, but whether it runs at
  * all does.
  *
- * A runtime filter clause (runtimefilter_is_clause(): whpg_rf_match() on an
- * exec Param of type internal, which only the planner can write -- SQL has
- * no expression of that type) cannot fail either, although the function is
- * not leakproof: the executor hands it NULL or a filter it built, and the
- * planner paired the operator with the key type, so only its key expression
- * could fail.
+ * A runtime filter clause (runtimefilter_is_clause(): a RuntimeFilterExpr,
+ * which only the planner writes -- SQL has no syntax for one) cannot fail
+ * either: the executor hands it NULL or a filter it built, and the planner
+ * paired the operator with the key type, so only its key expression could
+ * fail.
  */
 static bool
 stagedscan_can_fail_checker(Oid func_id, void *context)
@@ -1458,14 +1457,15 @@ stagedscan_fallback_cheaper(StagedScanState *gi, AOCSScanDesc scan, double segRo
 #define STAGED_DATETIME_BTREE_FAM_OID 434
 
 /*
- * A runtime filter clause (whpg_rf_match($p, col, hashop, sel)) compiled for
- * the fast path: the Param the hash join sets, and how to hash the column's
- * raw value as the join does -- inline for hashint2/4/8 (the hash functions
- * of the integer and datetime types), through fmgr for anything else. 'cur'
- * is the filter the Param holds for the block being tested, NULL when there
- * is none yet (or it was dropped, or the Param does not hold one), which lets
- * every row through. The switch-off whpg_rf_match() applies is the filter's
- * own tally (runtimefilter_probe_count()), shared with the qual's probes.
+ * A runtime filter clause (a RuntimeFilterExpr over $p, the column and the
+ * join's hash operator) compiled for the fast path: the Param the hash join
+ * sets, and how to hash the column's raw value as the join does -- inline
+ * for hashint2/4/8 (the hash functions of the integer and datetime types),
+ * through fmgr for anything else. 'cur' is the filter the Param holds for
+ * the block being tested, NULL when there is none yet (or it was dropped, or
+ * the Param does not hold one), which lets every row through. The switch-off
+ * the qual's probe applies is the filter's own tally
+ * (runtimefilter_probe_count()), shared with those probes.
  */
 typedef struct StagedScanSimpleFilter
 {
@@ -1546,16 +1546,15 @@ stagedscan_compile_simple(StagedScanState *gi, List *quals, TupleDesc tupdesc)
 		int64		value;
 
 		/*
-		 * A runtime filter on this column: the same checks whpg_rf_match()
-		 * makes on its arguments, made once here, so that the block loop can
-		 * hash the raw value and probe the filter directly.
+		 * A runtime filter on this column: the same checks the qual's probe
+		 * makes (runtimefilter_probe_init()), made once here, so that the
+		 * block loop can hash the raw value and probe the filter directly.
 		 */
 		if (runtimefilter_is_clause(clause))
 		{
-			FuncExpr   *fe = (FuncExpr *) clause;
-			Node	   *key = (Node *) lsecond(fe->args);
-			Node	   *opc = (Node *) lthird(fe->args);
-			Oid			opno;
+			RuntimeFilterExpr *rfexpr = (RuntimeFilterExpr *) clause;
+			Node	   *key = (Node *) rfexpr->key;
+			Oid			opno = rfexpr->hashop;
 			Oid			lhsproc;
 			Oid			rhsproc;
 			Oid			lefttype;
@@ -1566,9 +1565,8 @@ stagedscan_compile_simple(StagedScanState *gi, List *quals, TupleDesc tupdesc)
 				((Var *) key)->varlevelsup != 0 ||
 				((Var *) key)->vartype != att->atttypid)
 				return;
-			if (!IsA(opc, Const) || ((Const *) opc)->constisnull)
+			if (!OidIsValid(opno))
 				return;
-			opno = DatumGetObjectId(((Const *) opc)->constvalue);
 			if (!op_hashjoinable(opno, att->atttypid) ||
 				!get_op_hash_functions(opno, &lhsproc, &rhsproc))
 				return;
@@ -1576,8 +1574,8 @@ stagedscan_compile_simple(StagedScanState *gi, List *quals, TupleDesc tupdesc)
 			if (!IsBinaryCoercible(att->atttypid, lefttype))
 				return;
 
-			rf[nrf].paramid = ((Param *) linitial(fe->args))->paramid;
-			rf[nrf].collation = fe->inputcollid;
+			rf[nrf].paramid = rfexpr->paramid;
+			rf[nrf].collation = rfexpr->collation;
 			rf[nrf].inlineHash = (att->attlen == 8 && lhsproc == F_HASHINT8) ||
 				(att->attlen == 4 && lhsproc == F_HASHINT4) ||
 				(att->attlen == 2 && lhsproc == F_HASHINT2);
@@ -1734,7 +1732,7 @@ stagedscan_simple_match(const StagedScanSimpleClause *simple, int nsimple, int64
  * now, for the block about to be tested. The hash join sets the Param before
  * it reads a probe row and only changes it on a rebuild, so once per block is
  * often enough; a NULL Param (no filter yet, or dropped) lets every row
- * through, as whpg_rf_match() does.
+ * through, as the qual's probe does.
  */
 static inline void
 stagedscan_rf_bind(StagedScanState *gi)
