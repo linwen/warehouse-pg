@@ -24,6 +24,23 @@
 
 /* GUCs, see guc_gp.c */
 extern bool whpg_enable_runtime_filter;
+
+/*
+ * How far the planner pass trusts its estimates (whpg_runtime_filter_mode):
+ * estimate gates a filter on them; eager plans one for every join whose
+ * shape allows it and leaves the rows that arrive to decide (nodeHashjoin.c:
+ * sizing, publishing, the switch-off); auto is eager for a probe whose key
+ * column has no statistics -- a table never analyzed -- and estimate
+ * otherwise.
+ */
+typedef enum RuntimeFilterMode
+{
+	RF_MODE_ESTIMATE,
+	RF_MODE_EAGER,
+	RF_MODE_AUTO
+} RuntimeFilterMode;
+
+extern int	whpg_runtime_filter_mode;
 extern int	whpg_runtime_filter_max_size;	/* kB, one filter */
 extern double whpg_runtime_filter_max_selectivity;
 extern int	whpg_runtime_filter_min_probe_rows;

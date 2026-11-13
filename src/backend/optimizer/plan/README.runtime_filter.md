@@ -245,7 +245,11 @@ call per row.
 - a probe estimated below `whpg_runtime_filter_min_probe_rows`, a join
   expected to keep more than `whpg_runtime_filter_max_selectivity` of the
   probe rows, or an inner side that would need a filter above
-  `whpg_runtime_filter_max_size` to stay useful. Rows are a segment's. In
+  `whpg_runtime_filter_max_size` to stay useful. The first two, and the
+  statistics a join on several keys needs to choose one by, hold under
+  `whpg_runtime_filter_mode = estimate`; `eager` plans the filter anyway
+  and `auto` does so when the probe's key column has no statistics, leaving
+  the rows that arrive to decide (see "The filter"). Rows are a segment's. In
   a slice GPORCA runs on one segment (a join of replicated tables) its
   estimate counts a replicated table read there once per segment of the
   cluster; the pass divides that back by the segment count before the
@@ -257,6 +261,7 @@ call per row.
 | GUC | default | meaning |
 |---|---|---|
 | `whpg_enable_runtime_filter` | on | master switch, both optimizers |
+| `whpg_runtime_filter_mode` | estimate | how far the planner pass trusts its estimates: `estimate` gates a filter on them (the three developer GUCs below); `eager` plans one for every join whose shape allows it and leaves the rows that arrive to size it, publish it or not, and switch it off; `auto` is `eager` for a probe whose key column has no statistics (a table never analyzed), `estimate` otherwise. The size gate stays in every mode |
 | `whpg_runtime_filter_max_size` | 4 MB | the largest filter planned (64 kB to 64 MB); a denser one is dropped at run time. The filter is memory of its own: up to this much per filtered join and segment process on top of the join's share of `statement_mem`, which the hash table does not shrink to make room for |
 | `whpg_runtime_filter_max_selectivity` | 0.5 | developer: no filter when more of the probe is expected to match |
 | `whpg_runtime_filter_min_probe_rows` | 10000 | developer: no filter for a smaller probe (rows as the plan node estimates them) |

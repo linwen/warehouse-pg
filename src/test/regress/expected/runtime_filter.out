@@ -347,6 +347,31 @@ SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d
  f
 (1 row)
 
+-- The mode. estimate, the default, judges by the estimates; eager plans a
+-- filter wherever the shape allows one and leaves the rows to decide, so
+-- the unselective join gets one and the scan gives it up as it runs; auto
+-- does so only for a probe whose key column has no statistics.
+SET whpg_runtime_filter_mode = eager;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k$$) AS eager_unselective;
+ eager_unselective 
+-------------------
+ t
+(1 row)
+
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k$$) AS eager_unselective;
+ eager_unselective 
+-------------------
+ t
+(1 row)
+
+SET whpg_runtime_filter_mode = auto;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k$$) AS auto_with_statistics;
+ auto_with_statistics 
+----------------------
+ f
+(1 row)
+
+RESET whpg_runtime_filter_mode;
 -- A filter that turns out useless is switched off as the scan runs: the
 -- selectivity gate is lifted so that one is planned although five probe rows
 -- in six have a match, and the switch-off ratio lowered so that the scan
@@ -1005,7 +1030,7 @@ FROM gp_segment_configuration WHERE role = 'p' AND content >= 0;
 (3 rows)
 
 SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
-ERROR:  fault triggered, fault name:'runtime_filter_create' fault type:'error'  (seg0 slice1 127.0.0.1:8902 pid=315310)
+ERROR:  fault triggered, fault name:'runtime_filter_create' fault type:'error'  (seg2 slice1 127.0.0.1:8904 pid=357451)
 SELECT public.gp_inject_fault('runtime_filter_create', 'reset', dbid)
 FROM gp_segment_configuration WHERE role = 'p' AND content >= 0;
  gp_inject_fault 
@@ -1117,6 +1142,32 @@ SELECT count(*) FROM rf_fact_nostats f JOIN rf_dim_mk d ON f.k = d.k AND f.amt =
 (10 rows)
 
 RESET whpg_runtime_filter_explain;
+-- Under auto, the probe without statistics gets a filter over the first
+-- eligible key, and the rows decide.
+SET whpg_runtime_filter_mode = auto;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_nostats f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: ((f.k = d.k) AND (f.amt = d.amt))
+                     ->  Seq Scan on rf_fact_nostats f
+                           Runtime Filter: k
+                     ->  Hash
+                           ->  Seq Scan on rf_dim_mk d
+ Optimizer: Postgres-based planner
+(10 rows)
+
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_nostats f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt$$) AS auto_without_statistics;
+ auto_without_statistics 
+-------------------------
+ t
+(1 row)
+
+RESET whpg_runtime_filter_mode;
 ----------------------------------------------------------------------
 -- Part 2: GPORCA
 ----------------------------------------------------------------------

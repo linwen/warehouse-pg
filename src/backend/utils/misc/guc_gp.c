@@ -528,6 +528,13 @@ static const struct config_enum_entry explain_memory_verbosity_options[] = {
 	{NULL, 0}
 };
 
+static const struct config_enum_entry whpg_runtime_filter_mode_options[] = {
+	{"estimate", RF_MODE_ESTIMATE},
+	{"eager", RF_MODE_EAGER},
+	{"auto", RF_MODE_AUTO},
+	{NULL, 0}
+};
+
 static const struct config_enum_entry debug_dtm_action_options[] = {
 	{"none", DEBUG_DTM_ACTION_NONE},
 	{"delay", DEBUG_DTM_ACTION_DELAY},
@@ -5109,6 +5116,22 @@ struct config_enum ConfigureNamesEnum_gp[] =
 		},
 		&explain_memory_verbosity,
 		EXPLAIN_MEMORY_VERBOSITY_SUPPRESS, explain_memory_verbosity_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"whpg_runtime_filter_mode", PGC_USERSET, QUERY_TUNING_OTHER,
+			gettext_noop("How far a hash join's runtime filter trusts the planner's estimates."),
+			gettext_noop("estimate: no filter for a probe estimated small, a join expected to keep "
+						 "most of its probe rows, or a join on several keys without statistics to "
+						 "choose one by. eager: a filter for every join whose shape allows one; the "
+						 "rows that arrive size it, decide whether it is published and switch it off "
+						 "when it proves useless. auto: eager for a probe whose key column has no "
+						 "statistics, estimate otherwise."),
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&whpg_runtime_filter_mode,
+		RF_MODE_ESTIMATE, whpg_runtime_filter_mode_options,
 		NULL, NULL, NULL
 	},
 

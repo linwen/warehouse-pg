@@ -144,6 +144,17 @@ SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_fact_heap g O
 -- Too many probe rows would match: no filter.
 SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k$$) AS unselective;
 
+-- The mode. estimate, the default, judges by the estimates; eager plans a
+-- filter wherever the shape allows one and leaves the rows to decide, so
+-- the unselective join gets one and the scan gives it up as it runs; auto
+-- does so only for a probe whose key column has no statistics.
+SET whpg_runtime_filter_mode = eager;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k$$) AS eager_unselective;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k$$) AS eager_unselective;
+SET whpg_runtime_filter_mode = auto;
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k$$) AS auto_with_statistics;
+RESET whpg_runtime_filter_mode;
+
 -- A filter that turns out useless is switched off as the scan runs: the
 -- selectivity gate is lifted so that one is planned although five probe rows
 -- in six have a match, and the switch-off ratio lowered so that the scan
@@ -449,6 +460,14 @@ SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k AND f.tag = d.nam
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM rf_fact_nostats f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt;
 RESET whpg_runtime_filter_explain;
+
+-- Under auto, the probe without statistics gets a filter over the first
+-- eligible key, and the rows decide.
+SET whpg_runtime_filter_mode = auto;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_nostats f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_nostats f JOIN rf_dim_mk d ON f.k = d.k AND f.amt = d.amt$$) AS auto_without_statistics;
+RESET whpg_runtime_filter_mode;
 
 ----------------------------------------------------------------------
 -- Part 2: GPORCA

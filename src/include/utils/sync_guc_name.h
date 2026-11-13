@@ -184,6 +184,7 @@
 		"whpg_runtime_filter_max_selectivity",
 		"whpg_runtime_filter_max_size",
 		"whpg_runtime_filter_min_probe_rows",
+		"whpg_runtime_filter_mode",
 		"whpg_staged_scan_density_min_blocks",
 		"whpg_staged_scan_fallback_margin",
 		"whpg_staged_scan_min_selectivity",

@@ -530,6 +530,41 @@ rf_plan_rows(RuntimeFilterPlanContext *cx, Plan *plan)
 	return rows / nseg;
 }
 
+/*
+ * Plan a filter for this join whatever the estimates say? Under
+ * whpg_runtime_filter_mode = eager, always; under auto, when the probe
+ * column has no statistics to estimate by (a table never analyzed), since
+ * the gates would then judge on defaults. The rows that arrive decide the
+ * rest (nodeHashjoin.c): the filter's size, whether it is published, and
+ * the switch-off once it proves useless.
+ */
+static bool
+rf_eager(RuntimeFilterPlanContext *cx, SeqScan *scan, Node *scanKey)
+{
+	RangeTblEntry *rte;
+	Relation	rel;
+	bool		stats;
+
+	if (whpg_runtime_filter_mode == RF_MODE_EAGER)
+		return true;
+	if (whpg_runtime_filter_mode != RF_MODE_AUTO)
+		return false;
+
+	while (scanKey != NULL && IsA(scanKey, RelabelType))
+		scanKey = (Node *) ((RelabelType *) scanKey)->arg;
+	if (scanKey == NULL || !IsA(scanKey, Var) ||
+		scan->scan.scanrelid <= 0 ||
+		scan->scan.scanrelid > list_length(cx->rtable))
+		return false;
+	rte = rt_fetch(scan->scan.scanrelid, cx->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+	rel = table_open(rte->relid, NoLock);	/* the query holds its lock */
+	stats = rf_column_ndistinct(rel, ((Var *) scanKey)->varattno) > 0;
+	table_close(rel, NoLock);
+	return !stats;
+}
+
 static void
 rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 {
@@ -546,6 +581,7 @@ rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 	double		probeRows;
 	double		buildRows;
 	double		joinSel;
+	bool		eager;
 	Oid			collation;
 	int			paramid;
 	Expr	   *clause;
@@ -655,6 +691,8 @@ rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 			else if (rf_key_match_fraction(cx, hj, i, keyScan, keyScanKey,
 										   probeRows, buildRows, &keySel))
 				keySel = Max(keySel, joinSel);
+			else if (rf_eager(cx, keyScan, keyScanKey))
+				keySel = joinSel;	/* no statistics: the first such key will do */
 			else
 				keyDecline = RF_DECLINE_KEY_STATS;
 		}
@@ -688,15 +726,19 @@ rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 
 	/*
 	 * Worth it? A small probe gains nothing; a probe most of whose rows
-	 * match pays the probes for little; an inner side too large for a
-	 * filter within the size limit would only be dropped at run time.
+	 * match pays the probes for little -- by the estimates, which the mode
+	 * says how far to trust (rf_eager()). An inner side too large for a
+	 * filter within the size limit would only be dropped at run time, after
+	 * a pass over it, in any mode.
 	 */
-	if (probeRows < (double) whpg_runtime_filter_min_probe_rows || probeRows <= 0)
+	eager = rf_eager(cx, scan, scanKey);
+	if (!eager &&
+		(probeRows < (double) whpg_runtime_filter_min_probe_rows || probeRows <= 0))
 	{
 		hj->rf_decline = RF_DECLINE_PROBE_SMALL;
 		return;
 	}
-	if (sel > whpg_runtime_filter_max_selectivity)
+	if (!eager && sel > whpg_runtime_filter_max_selectivity)
 	{
 		hj->rf_decline = (nkeys == 1) ? RF_DECLINE_UNSELECTIVE
 			: RF_DECLINE_KEYS_UNSELECTIVE;

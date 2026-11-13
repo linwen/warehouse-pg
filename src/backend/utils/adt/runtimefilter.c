@@ -60,6 +60,7 @@
 
 /* GUCs */
 bool		whpg_enable_runtime_filter = true;
+int			whpg_runtime_filter_mode = RF_MODE_ESTIMATE;
 int			whpg_runtime_filter_max_size = 4096;	/* kB */
 double		whpg_runtime_filter_max_selectivity = 0.5;
 int			whpg_runtime_filter_min_probe_rows = 10000;
