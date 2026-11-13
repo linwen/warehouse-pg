@@ -309,6 +309,27 @@ runtimefilter_merge(struct varlena *into, const struct varlena *other)
 }
 
 /*
+ * The filter a join publishes when it has none to publish -- not built,
+ * dropped as too full, withheld as useless: a filter switched off from the
+ * start, so that the scans reading the Param know the join is done deciding
+ * (a Param still NULL means the filter is yet to come) and give the clause
+ * up (ExecScan). Probed, it lets every row through, as a NULL Param does;
+ * it is never written to, since every probe tests 'disabled' first.
+ */
+struct varlena *
+runtimefilter_dead(void)
+{
+	static RuntimeFilter *dead = NULL;
+
+	if (dead == NULL)
+	{
+		dead = rf_alloc(0, TopMemoryContext);
+		dead->disabled = 1;
+	}
+	return (struct varlena *) dead;
+}
+
+/*
  * The filter a Param holds, or NULL if what it holds is not a filter the
  * hash join built -- a guard against an executor or planner fault, since
  * only the planner writes the clause that reads it. NULL lets every row
@@ -335,9 +356,11 @@ runtimefilter_check(struct varlena *v)
 /*
  * The probe of a RuntimeFilterExpr (primnodes.h), the clause the planner
  * puts in the probe scan's qual: true if the key may be in the filter. The
- * executor compiles the node to a step of its own (EEOP_RUNTIME_FILTER,
- * execExpr.c) whose state this is; the steps before it leave the key in the
- * state, and the clause rests on no catalog entry.
+ * executor compiles the node to steps of its own (execExpr.c) whose state
+ * this is: EEOP_RUNTIME_FILTER_LIVE asks whether there is a filter to probe
+ * and jumps over the rest when there is not, the steps between leave the
+ * key in the state, EEOP_RUNTIME_FILTER probes. The clause rests on no
+ * catalog entry.
  *
  * A NULL filter -- none was built, or it was dropped -- accepts every row. A
  * NULL key is rejected when the hash operator is strict, since the join
@@ -423,6 +446,34 @@ runtimefilter_probe_init(const RuntimeFilterExpr *rfexpr)
 	else
 		fmgr_info(hashproc, &probe->hashfn);
 	return probe;
+}
+
+/*
+ * Is there a filter to probe? False for a clause not to be trusted, a Param
+ * not set (no filter built, or none worth publishing), a Param that does
+ * not hold a filter, or a filter switched off as useless. The step before
+ * the key's evaluation asks (ExecEvalRuntimeFilterLive()), so that none of
+ * these costs a row more than the question; runtimefilter_probe() asks
+ * again, cheaply, and stands on its own.
+ */
+bool
+runtimefilter_probe_live(RuntimeFilterProbeState *probe, ExprContext *econtext)
+{
+	ParamExecData *prm;
+	RuntimeFilter *f;
+
+	if (probe->unusable || econtext->ecxt_param_exec_vals == NULL)
+		return false;
+	prm = &econtext->ecxt_param_exec_vals[probe->paramid];
+	if (prm->isnull)
+		return false;
+	f = (RuntimeFilter *) runtimefilter_check((struct varlena *) DatumGetPointer(prm->value));
+	if (f == NULL)
+	{
+		rf_probe_give_up(probe, "the parameter does not hold a filter");
+		return false;
+	}
+	return !f->disabled;
 }
 
 bool

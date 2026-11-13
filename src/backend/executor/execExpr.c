@@ -772,10 +772,26 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				/*
 				 * WHPG: a hash join's runtime filter probe. The key is
 				 * evaluated into the probe's state; one step then tests it
-				 * against the filter the Param holds (runtimefilter.c).
+				 * against the filter the Param holds (runtimefilter.c). Both
+				 * are jumped over while there is no filter to probe -- none
+				 * published, or one switched off as useless -- so that a
+				 * dead clause costs a row one test, not its key: the first
+				 * step answers true and marks the result NULL only when the
+				 * filter is live (ExecEvalRuntimeFilterLive()), and the jump
+				 * takes a non-NULL result past the probe.
 				 */
 				RuntimeFilterExpr *rfexpr = (RuntimeFilterExpr *) node;
 				RuntimeFilterProbeState *probe = runtimefilter_probe_init(rfexpr);
+				int			jumpidx;
+
+				scratch.opcode = EEOP_RUNTIME_FILTER_LIVE;
+				scratch.d.rtfilter.probe = probe;
+				ExprEvalPushStep(state, &scratch);
+
+				scratch.opcode = EEOP_JUMP_IF_NOT_NULL;
+				scratch.d.jump.jumpdone = -1;	/* adjust below */
+				ExprEvalPushStep(state, &scratch);
+				jumpidx = state->steps_len - 1;
 
 				ExecInitExprRec(rfexpr->key, state,
 								&probe->keyvalue, &probe->keynull);
@@ -783,6 +799,8 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				scratch.opcode = EEOP_RUNTIME_FILTER;
 				scratch.d.rtfilter.probe = probe;
 				ExprEvalPushStep(state, &scratch);
+
+				state->steps[jumpidx].d.jump.jumpdone = state->steps_len;
 				break;
 			}
 

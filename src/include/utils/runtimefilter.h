@@ -48,6 +48,7 @@ extern void runtimefilter_restart(RuntimeFilterBuilder *builder, double nkeys);
 extern struct varlena *runtimefilter_finish(RuntimeFilterBuilder *builder);
 extern struct varlena *runtimefilter_fold(struct varlena *filter);
 extern double runtimefilter_estimated_keys(const struct varlena *filter);
+extern struct varlena *runtimefilter_dead(void);
 extern bool runtimefilter_merge(struct varlena *into,
 								const struct varlena *other);
 extern struct varlena *runtimefilter_check(struct varlena *v);
@@ -215,6 +216,8 @@ typedef struct RuntimeFilterProbeState
 
 struct ExprContext;
 extern RuntimeFilterProbeState *runtimefilter_probe_init(const RuntimeFilterExpr *rfexpr);
+extern bool runtimefilter_probe_live(RuntimeFilterProbeState *probe,
+									 struct ExprContext *econtext);
 extern bool runtimefilter_probe(RuntimeFilterProbeState *probe,
 								struct ExprContext *econtext);
 

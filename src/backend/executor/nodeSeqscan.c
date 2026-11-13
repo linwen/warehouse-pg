@@ -325,6 +325,8 @@ ExecInitSeqScanForPartition(SeqScan *node, EState *estate,
 	else
 		scanstate->ss.ps.qual =
 			ExecInitQual(node->scan.plan.qual, (PlanState *) scanstate);
+	/* WHPG: the runtime filter clauses in it, to be given up when dead */
+	ExecScanInitRuntimeFilters(&scanstate->ss, node->scan.plan.qual);
 
 	return scanstate;
 }

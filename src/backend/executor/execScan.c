@@ -22,6 +22,9 @@
 #include "miscadmin.h"
 #include "utils/faultinjector.h"
 #include "utils/memutils.h"
+#include "utils/runtimefilter.h"
+
+static bool ExecScanRuntimeFiltersDead(ScanState *node);
 
 
 
@@ -203,6 +206,21 @@ ExecScan(ScanState *node,
 	{
 		TupleTableSlot *slot;
 
+		/*
+		 * WHPG: a runtime filter clause whose filter has been given up would
+		 * cost every row the qual's evaluation for nothing. Once all of the
+		 * scan's filters are dead, the qual without them takes over -- none
+		 * at all if nothing else was there, and the next call takes the
+		 * shortcut above. Looked at every 4096 rows.
+		 */
+		if (node->rf_paramids != NIL && ((++node->rf_rows) & 4095) == 0 &&
+			ExecScanRuntimeFiltersDead(node))
+		{
+			node->ps.qual = node->rf_lessqual;
+			node->rf_paramids = NIL;
+			qual = node->rf_lessqual;
+		}
+
 		slot = ExecScanFetch(node, accessMtd, recheckMtd);
 
 		/*
@@ -297,6 +315,67 @@ ExecAssignScanProjectionInfoWithVarno(ScanState *node, Index varno)
 }
 
 /*
+ * WHPG: note the runtime filter clauses of a scan's qual (planrtfilter.c),
+ * so that ExecScan can give them up once their filters are dead: the
+ * Params they read, and the qual compiled without them. For a scan whose
+ * qual has none, nothing is kept and ExecScan's check costs one test.
+ */
+void
+ExecScanInitRuntimeFilters(ScanState *node, List *qual)
+{
+	List	   *filters;
+	List	   *rest;
+	ListCell   *lc;
+
+	node->rf_paramids = NIL;
+	node->rf_allparamids = NIL;
+	node->rf_fullqual = NULL;
+	node->rf_lessqual = NULL;
+	node->rf_rows = 0;
+
+	if (node->ps.qual == NULL)
+		return;
+	runtimefilter_split_qual(qual, &filters, &rest);
+	if (filters == NIL)
+		return;
+	foreach(lc, filters)
+		node->rf_allparamids = lappend_int(node->rf_allparamids,
+										   ((RuntimeFilterExpr *) lfirst(lc))->paramid);
+	node->rf_paramids = node->rf_allparamids;
+	node->rf_fullqual = node->ps.qual;
+	node->rf_lessqual = ExecInitQual(rest, &node->ps);
+}
+
+/*
+ * Has every runtime filter of the scan been given up? A Param still NULL
+ * is a filter yet to come (the join publishes a dead one in place of none,
+ * runtimefilter_dead()), so the clause stays; a Param holding anything but
+ * a live filter -- one switched off, the dead one, or not a filter at all,
+ * which the probe gives up on -- is a clause that lets every row through.
+ */
+static bool
+ExecScanRuntimeFiltersDead(ScanState *node)
+{
+	ParamExecData *vals = node->ps.ps_ExprContext->ecxt_param_exec_vals;
+	ListCell   *lc;
+
+	if (vals == NULL)
+		return false;
+	foreach(lc, node->rf_paramids)
+	{
+		ParamExecData *prm = &vals[lfirst_int(lc)];
+		RuntimeFilter *f;
+
+		if (prm->isnull)
+			return false;
+		f = (RuntimeFilter *) runtimefilter_check((struct varlena *) DatumGetPointer(prm->value));
+		if (f != NULL && !f->disabled)
+			return false;
+	}
+	return true;
+}
+
+/*
  * ExecScanReScan
  *
  * This must be called within the ReScan function of any plan node type
@@ -312,6 +391,14 @@ ExecScanReScan(ScanState *node)
 	 * can tell that this plan node is not positioned on a tuple.
 	 */
 	ExecClearTuple(node->ss_ScanTupleSlot);
+
+	/* WHPG: a rescan may bring a new runtime filter: watch the clauses again */
+	if (node->rf_allparamids != NIL && node->rf_paramids == NIL)
+	{
+		node->ps.qual = node->rf_fullqual;
+		node->rf_paramids = node->rf_allparamids;
+	}
+	node->rf_rows = 0;
 
 	/* Rescan EvalPlanQual tuple if we're inside an EvalPlanQual recheck */
 	if (estate->es_epq_active != NULL)

@@ -486,6 +486,7 @@ extern TupleTableSlot *ExecScan(ScanState *node, ExecScanAccessMtd accessMtd,
 extern void ExecAssignScanProjectionInfo(ScanState *node);
 extern void ExecAssignScanProjectionInfoWithVarno(ScanState *node, Index varno);
 extern void ExecScanReScan(ScanState *node);
+extern void ExecScanInitRuntimeFilters(ScanState *node, List *qual);
 
 /*
  * prototypes from functions in execTuples.c

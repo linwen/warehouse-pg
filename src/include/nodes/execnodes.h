@@ -1483,6 +1483,20 @@ typedef struct ScanState
 	Relation	ss_currentRelation;
 	struct TableScanDescData *ss_currentScanDesc;
 	TupleTableSlot *ss_ScanTupleSlot;
+
+	/*
+	 * WHPG: the runtime filter clauses in ps.qual (planrtfilter.c), by the
+	 * exec Params they read, and the qual without them. Once every filter
+	 * of the scan has been given up -- switched off as useless, or never
+	 * published -- the scan runs the shorter qual, none at all if nothing
+	 * else was there (ExecScan). The full qual is kept for a rescan, which
+	 * may bring a new filter.
+	 */
+	List	   *rf_paramids;	/* the clauses still watched; NIL once given up, or none */
+	List	   *rf_allparamids; /* all of them, for the rescan */
+	ExprState  *rf_fullqual;	/* ps.qual as compiled */
+	ExprState  *rf_lessqual;	/* ps.qual without the filter clauses, or NULL */
+	uint32		rf_rows;		/* rows fetched, for the periodic check */
 } ScanState;
 
 /* ----------------

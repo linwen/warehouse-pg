@@ -122,8 +122,8 @@ formed and no `ExecQual()`. The filter is bound from the Param once per block
 block the fast path cannot take (NULLs, RLE/delta layout) goes row by row
 through the qual's probe as before.
 
-The probe returns true for a NULL filter (not built yet, dropped as
-too full, a Parallel Hash) and false for a NULL key: a strict hash operator
+The probe returns true for a NULL filter (not built yet, a Parallel Hash)
+or a dead one (see below) and false for a NULL key: a strict hash operator
 never matches a NULL, and the join types that get a filter drop such rows.
 A join over a non-strict hash operator, which hashes NULL as 0 and may match
 it (`ExecHashGetHashValue()`), gets no filter.
@@ -137,6 +137,16 @@ tally is kept in the filter itself (`RuntimeFilter.seen`, `.passed`,
 Staged Scan fast path's, each partition's scan under a dynamic scan -- counts
 into the same tally and gives it up together, rather than each starting the
 65536 rows over; a rebuilt hash table brings a new filter, judged afresh.
+A dead filter then costs the rows nothing: the clause compiles to a test
+first (`EEOP_RUNTIME_FILTER_LIVE`) that jumps over the key's evaluation and
+the probe when there is no filter to probe, and the scan, which noted the
+filter clauses of its qual at init, asks every 4096 rows whether every
+filter it reads is dead and from then on runs its qual without them --
+none at all when nothing else was there (`ExecScan`); a rescan puts the full
+qual back. A join with no filter to publish -- none built, dropped as too
+full, withheld as useless -- publishes a dead one (`runtimefilter_dead()`),
+switched off from the start, so that the scan can tell it from a filter yet
+to come; every probe treats it as a Param not set.
 The clause is a node of its own, `RuntimeFilterExpr` (primnodes.h), which
 only the planner writes: SQL has no syntax for it, and it rests on no
 catalog entry -- no `pg_proc` row, no catalog version change -- so a minor

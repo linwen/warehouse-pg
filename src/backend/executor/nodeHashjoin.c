@@ -306,10 +306,17 @@ ExecHashJoinPublishRuntimeFilter(HashJoinState *node, HashState *hashNode)
 		SIMPLE_FAULT_INJECTOR("runtime_filter_published");
 #endif
 
+	/*
+	 * No filter to publish -- not built, dropped, withheld -- is published
+	 * as the dead filter, one switched off from the start: the scan then
+	 * knows the join is done deciding and gives the clause up (ExecScan),
+	 * where a Param still NULL would mean a filter yet to come.
+	 */
 	prm = &estate->es_param_exec_vals[node->hj_rfParamId];
 	prm->execPlan = NULL;
-	prm->value = PointerGetDatum(node->hj_rfFilter);
-	prm->isnull = (node->hj_rfFilter == NULL);
+	prm->value = PointerGetDatum(node->hj_rfFilter != NULL ?
+								 node->hj_rfFilter : runtimefilter_dead());
+	prm->isnull = false;
 }
 
 /*
