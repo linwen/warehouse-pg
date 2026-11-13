@@ -386,50 +386,60 @@ order under `ORDER BY ... LIMIT`.
 
 **TPC-DS, scale factor 30**, release build (no assertions), GPORCA, the same
 schema (`store_sales` 86M rows in 221 partitions, an 11 GB database) and
-cluster, on the branch's final code. Each query ran five rounds of one run
+cluster, on the branch's final code. Each query ran three rounds of one run
 per setting, the two settings alternating within a round and the starting
 side alternating from one query to the next, so that neither setting owns
-the cold first touch of a query's data; the median of each setting's five
+the cold first touch of a query's data; the median of each setting's three
 runs is the measurement, and every run is kept in the log. q23 and q95, the
-two largest spillers, were left out: q95 runs out of temporary space on
-this volume under both settings, q23 takes 100 s and gets no filter. 63 of
-the 97 queries got a filter. By the medians: the 97 queries 354.8 s off,
-334.9 s on (-5.6%); the 63 with a filter 110.0 s and 85.6 s (-22.2%); the
-34 without one -- identical plans -- 244.8 s and 249.4 s (+1.9%). Per query
-with a filter: median -14.6%, 43 queries more than 5% faster, none more
-than 5% slower; without a filter the median change is -0.6% and the spread
--9%..+19%, the noise band of this host (the five runs of one setting differ
-by a factor of 1.24 at the median, and by 14 for q27, whose first run was
-cold). Earlier sweeps of two runs per setting, on earlier commits of the
-branch, gave the queries with a filter -15% to -21% in total and medians of
--8% to -18%, with two to four queries more than 5% slower each time, which
-the five-run medians show to have been noise.
+two largest spillers, were left out (q95 runs out of temporary space on
+this volume under both settings, q23 takes 100 s and gets no filter), and
+q67 ran out of temporary space under both settings this time, with 8 GB
+free on the volume, so it is not timed. 63 of the 96 timed queries got a
+filter. By the medians: the 96 queries 305.8 s off, 278.8 s on (-8.8%); the
+63 with a filter 104.4 s and 82.4 s (-21.1%); the 33 without one --
+identical plans -- 201.3 s and 196.4 s (-2.5%). Per query with a filter:
+median -14.8%, 45 queries more than 5% faster, two more than 5% slower (q72
+and q93, below); without a filter the median change is -0.3% and the spread
+-20%..+4%, the two beyond -10% (q78, q87) being 20-second queries whose
+off runs varied by a quarter. The three runs of one setting differ by 3%
+at the median and by 2.65x at worst (one on run of q19). A five-run sweep
+of the same kind on the branch's sixth commit -- before the rows arriving
+sized the filter, before a dead filter's clause was given up and before the
+bitmap -- gave the 63 queries with a filter -22.2% in total and a median of
+-14.6%, 43 of them more than 5% faster and none more than 5% slower; the
+later commits change nothing on this workload within the noise, except
+that q81, whose filter that sweep dropped at build as too full for its
+estimate (+5%, 607 to 635 ms), is rebuilt now and reads -2%.
 
 | query | filters | filter off, median (ms) | filter on, median (ms) | change |
 |---|---|---|---|---|
-| q50 | `ss_ticket_number` (one key of two) | 3058 | 648 | -79% |
-| q03 | `ss_item_sk` | 504 | 204 | -60% |
-| q16 | 3 | 3444 | 1484 | -57% |
-| q94 | 3 | 1761 | 857 | -51% |
-| q84 | 3 | 237 | 125 | -47% |
-| q63 | `ss_item_sk` | 526 | 283 | -46% |
-| q90 | 2 | 945 | 520 | -45% |
-| q64 | 7 | 12153 | 7206 | -41% |
-| q53 | `ss_item_sk` | 602 | 364 | -40% |
-| q48 | 2 | 1204 | 737 | -39% |
-| q96 | `ss_sold_time_sk` | 2060 | 1268 | -38% |
-| q88 | 8 | 12283 | 7724 | -37% |
-| q07 | `ss_cdemo_sk` | 907 | 594 | -35% |
-| q17 | 5 | 1429 | 936 | -34% |
-| q19 | 1 | 248 | 166 | -33% |
-| q26 | 1 | 512 | 349 | -32% |
-| q55 | `ss_item_sk` | 145 | 99 | -32% |
-| q29 | 3 | 1170 | 824 | -30% |
-| q27 | `ss_cdemo_sk` | 1001 | 712 | -29% |
-| q66 | 4 | 1018 | 722 | -29% |
-| q21 | 1 | 138 | 104 | -25% |
-| q89 | 1 | 771 | 594 | -23% |
-| q72 | 2 | 12965 | 13326 | +3% |
+| q03 | `ss_item_sk` | 635 | 185 | -71% |
+| q50 | `ss_ticket_number` (one key of two) | 2975 | 988 | -67% |
+| q16 | 3 | 3196 | 1249 | -61% |
+| q63 | `ss_item_sk` | 513 | 241 | -53% |
+| q94 | 3 | 1728 | 848 | -51% |
+| q90 | 2 | 940 | 522 | -44% |
+| q53 | `ss_item_sk` | 606 | 338 | -44% |
+| q52 | `ss_item_sk` | 173 | 97 | -44% |
+| q48 | 2 | 1225 | 709 | -42% |
+| q84 | 3 | 234 | 137 | -41% |
+| q88 | 8 | 12554 | 7464 | -41% |
+| q42 | `ss_item_sk` | 163 | 97 | -40% |
+| q96 | `ss_sold_time_sk` | 2096 | 1252 | -40% |
+| q55 | `ss_item_sk` | 172 | 105 | -39% |
+| q29 | 3 | 1151 | 777 | -32% |
+| q17 | 5 | 1209 | 817 | -32% |
+| q89 | `ss_item_sk` | 773 | 537 | -31% |
+| q66 | 4 | 1014 | 707 | -30% |
+| q07 | `ss_cdemo_sk` | 903 | 632 | -30% |
+| q21 | `inv_item_sk` | 134 | 94 | -30% |
+| q80 | 5 | 1316 | 924 | -30% |
+| q82 | 2 | 1719 | 1244 | -28% |
+| q26 | `cs_bill_cdemo_sk` | 511 | 370 | -28% |
+| q64 | 7 | 9612 | 7025 | -27% |
+| q27 | `ss_cdemo_sk` | 1001 | 738 | -26% |
+| q24 | `ss_store_sk` | 8425 | 6615 | -21% |
+| q72 | 2 | 11856 | 12775 | +8% |
 
 q03 shows what the fast path changes: `Dynamic Staged Seq Scan on
 store_sales ... Runtime Filter: ss_item_sk, Rows Removed by Filter: 6977374,
@@ -439,17 +449,57 @@ Phase B skips almost nothing, and the gain is Phase A's alone: 17M key
 values hashed and probed off the datum array, 18k rows assembled. At scale
 factor 10, with the clause evaluated row by row, the same query gained 25%.
 
-No query with a filter is more than 5% slower by its median. The largest
-losses are q81 (607 to 635 ms; its five runs per setting range from 580 to
-907 ms), q06 (224 to 233 ms), q93 (73 to 76 ms) and q72 (12.97 to 13.33 s;
-runs 11.6-13.9 s against 11.8-14.1 s), each inside the spread of its own
-runs. q21 and q89, 8-11% slower in the earliest sweeps -- a filter that
-kept 11% of the rows had the Staged Scan's first-batch check hand every
-partition back to the ordinary scan, where staying was cheaper -- gain 25%
-and 23% since the two corrections to that check. Every query returned the
-same rows on and off; q24, q65, q71 and q73 list them in another order, and
-q64, under `ORDER BY ... LIMIT 100`, lists different tied rows (without the
-LIMIT its 582 result rows are identical on and off).
+Two queries with a filter are more than 5% slower by their medians. q72
+(11.86 to 12.78 s) spends its 12 seconds in a join its two filters do not
+touch, and its on runs, 11.3, 12.8 and 14.1 s, straddle its off runs of
+11.8-12.1 s: the median is the noise of a long query (the five-run sweep
+had it at +3%, the sweep before at +10%, the one before that at -3%). q93
+(70 to 74 ms) looks for a return reason the SF30 data does not have and
+returns no rows; its two filters are built over no keys and have nothing to
+remove, so what shows is their build. q21 and q89, 8-11% slower in the
+earliest sweeps -- a filter that kept 11% of the rows had the Staged Scan's
+first-batch check hand every partition back to the ordinary scan, where
+staying was cheaper -- gain 30% since the two corrections to that check.
+Every query returned the same rows on and off; q24, q64, q65, q71 and q73
+list them in another order (q64 under `ORDER BY ... LIMIT 100`, where tied
+rows may differ: here they did not).
+
+**The mode GUC, and tables never analyzed.** `whpg_runtime_filter_mode =
+eager` plans a filter for every structurally eligible join, leaving out the
+gates on probe rows and selectivity and letting the rows that arrive decide.
+Measured against `estimate` on the same SF30 setup, statistics in place, two
+interleaved rounds, the filter on under both: the 96 queries 281.8 s against
+285.9 s (+1.5%). Eager adds filters to 72 of them, the joins the gates had
+declined as too small or too unselective: those 72 take 224.9 s against
+229.1 s (+1.9%), median change per query +0.0%, 9 queries more than 5%
+faster (q15 -27%, 439 to 321 ms; q46 -23%, 3.65 to 2.81 s; q08 and q68
+-14%; q73 -13%) and 10 more than 5% slower (q10 +22%, 641 to 785 ms; q64
++20%, 6.7 to 8.0 s; q78 +11%; q80 and q19 +10%); the 24 queries whose plans
+are the same under both modes move -0.1%. With statistics in place, then,
+the filters the gates decline are worth nothing in the whole, and the gates
+spare the ten losses: `estimate` is the default. Without statistics -- the
+`tpcds` schema's `pg_statistic` rows parked and its `reltuples` zeroed, as
+a schema loaded and never analyzed -- GPORCA plans every query differently:
+with no row counts it takes the dimension for the large side, so in q03,
+q42, q52 and q89 the 86M-row fact is redistributed and hashed and the
+73k-row `date_dim` is the probe, while q07, q19, q27, q34, q55 and q73 keep
+the fact as the probe. Under `estimate` no query of the 99 gets a filter
+(GPORCA puts every unanalyzed table at one row, so every probe falls under
+the 10 000-row gate); under `eager`, and `auto` (eager where the probe's key
+column has no statistics, which is everywhere here), 83 queries get 222
+filters. Timed on twelve star-join queries, two interleaved rounds,
+estimate against eager: 78.5 s against 64.9 s in total, but the difference
+is two long queries' noise -- q52's first estimate run took 37 s against
+11 s for its second, and q03 (-18%) and q89 (+15%), at 10 to 17 s a run,
+have runs 2 to 4 s apart -- while the other nine move within 5% and the
+median change per query is +0.9%. The filters eager adds to these plans sit
+on a dimension probe or on a fact probed against a hashed table of unknown
+size, and change nothing the noise does not hide; what a never-analyzed
+schema needs under GPORCA is ANALYZE, not a filter. The Postgres planner without
+statistics sizes a table from its file, so its estimates keep the right
+side large, but it plans a partitioned fact as an Append of partition
+scans, which the pass does not reach yet (follow-up), so the TPC-DS facts
+get no filter under it in either mode.
 
 **The fast path alone.** A 12M-row AOCO fact of 8 columns joined to a
 120k-key dimension, 1% of the fact's keys, clustered at the start of each
