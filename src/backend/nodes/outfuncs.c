@@ -1076,6 +1076,7 @@ _outHashJoin(StringInfo str, const HashJoin *node)
 	WRITE_NODE_FIELD(rf_paramids);
 	WRITE_INT_FIELD(rf_decline);
 	WRITE_INT_FIELD(rf_keyidx);
+	WRITE_FLOAT_FIELD(rf_probe_rows, "%.0f");
 }
 
 static void

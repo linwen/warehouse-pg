@@ -2612,7 +2612,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					probe != NULL && probe->plan_rows > 0)
 					txt = psprintf("declined: %s (%.0f%% of %.0f)", why,
 								   100.0 * Min(1.0, plan->plan_rows / probe->plan_rows),
-								   probe->plan_rows);
+								   hash_join->rf_probe_rows > 0 ?
+								   hash_join->rf_probe_rows : probe->plan_rows);
 				else
 					txt = psprintf("declined: %s", why);
 				ExplainPropertyText("Runtime Filter", txt, es);

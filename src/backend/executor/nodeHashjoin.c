@@ -217,6 +217,10 @@ ExecHashJoinStartRuntimeFilter(HashJoinState *node, HashState *hashNode,
 	ExecHashJoinResetRuntimeFilter(node);
 	if (!parallel)
 	{
+#ifdef FAULT_INJECTOR
+		/* the filter's allocation failing, as an out-of-memory error would */
+		SIMPLE_FAULT_INJECTOR("runtime_filter_create");
+#endif
 		hashNode->rf_builder =
 			runtimefilter_create(hashNode->ps.plan->plan_rows,
 								 estate->es_query_cxt);

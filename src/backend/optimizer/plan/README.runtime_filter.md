@@ -158,8 +158,11 @@ fire.
 words, one bit per word, so a probe touches a single cache line; it is fed
 the hash table's own 32-bit hash values, spread to 64 bits by a mixing
 function, block from the top half, bits from the bottom. It is sized at 16
-bits per expected key (about 1% false positives), never below 8 kB and never
-above `whpg_runtime_filter_max_size`. Should it come out too full -- more
+bits per expected key (about 1% false positives; the rate cannot fall below
+the number of keys over 2^32, since the filter is built from 32-bit hash
+values: 0.01% at 500,000 keys in a segment's filter, 0.1% near 5 million),
+never below 8 kB and never above `whpg_runtime_filter_max_size`. Should it
+come out too full -- more
 than 80% of its bits set once the table is built, about 17% false positives
 and climbing fast beyond -- the filter is dropped rather than probed for
 nothing; fullness is judged on the bits set, not on the tuples inserted, so an
@@ -221,14 +224,19 @@ call per row.
 - a probe estimated below `whpg_runtime_filter_min_probe_rows`, a join
   expected to keep more than `whpg_runtime_filter_max_selectivity` of the
   probe rows, or an inner side that would need a filter above
-  `whpg_runtime_filter_max_size` to stay useful.
+  `whpg_runtime_filter_max_size` to stay useful. Rows are a segment's. In
+  a slice GPORCA runs on one segment (a join of replicated tables) its
+  estimate counts a replicated table read there once per segment of the
+  cluster; the pass divides that back by the segment count before the
+  gates, so that a join of two replicated tables is judged on what the one
+  segment reads.
 
 ## GUCs
 
 | GUC | default | meaning |
 |---|---|---|
 | `whpg_enable_runtime_filter` | on | master switch, both optimizers |
-| `whpg_runtime_filter_max_size` | 4 MB | the largest filter planned (64 kB to 64 MB; one per join and segment process, outside the join's operator memory); a denser one is dropped at run time |
+| `whpg_runtime_filter_max_size` | 4 MB | the largest filter planned (64 kB to 64 MB); a denser one is dropped at run time. The filter is memory of its own: up to this much per filtered join and segment process on top of the join's share of `statement_mem`, which the hash table does not shrink to make room for |
 | `whpg_runtime_filter_max_selectivity` | 0.5 | developer: no filter when more of the probe is expected to match |
 | `whpg_runtime_filter_min_probe_rows` | 10000 | developer: no filter for a smaller probe (rows as the plan node estimates them) |
 | `whpg_runtime_filter_disable_ratio` | 0.95 | developer: a filter letting more of the probe rows through than this is switched off by the scan; 1 never switches off |

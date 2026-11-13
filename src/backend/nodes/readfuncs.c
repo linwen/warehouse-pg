@@ -3232,6 +3232,7 @@ _readHashJoin(void)
 	READ_NODE_FIELD(rf_paramids);
 	READ_INT_FIELD(rf_decline);
 	READ_INT_FIELD(rf_keyidx);
+	READ_FLOAT_FIELD(rf_probe_rows);
 
 	READ_DONE();
 }

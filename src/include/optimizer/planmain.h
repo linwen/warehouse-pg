@@ -164,6 +164,6 @@ extern void add_proc_oids_for_dump(Oid funcid);
 extern void runtimefilter_decide_plan(PlannerGlobal *glob, Plan *plan,
 									  List *subplans, List *rtable,
 									  List **paramExecTypes,
-									  bool hasRowSecurity);
+									  bool hasRowSecurity, bool orcaRows);
 
 #endif							/* PLANMAIN_H */

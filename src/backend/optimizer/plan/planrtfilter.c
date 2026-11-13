@@ -80,6 +80,8 @@ typedef struct RuntimeFilterPlanContext
 	PlannerGlobal *glob;
 	List	   *rtable;			/* what the plan's scanrelids index */
 	List	  **paramExecTypes;	/* where a new Param is declared */
+	bool		orcaRows;		/* the row estimates are GPORCA's (rf_plan_rows()) */
+	int			sliceIndex;		/* the slice the node being walked runs in, -1 unknown */
 } RuntimeFilterPlanContext;
 
 /*
@@ -487,6 +489,47 @@ rf_key_match_fraction(RuntimeFilterPlanContext *cx, HashJoin *hj, int i,
 	return true;
 }
 
+static bool
+rf_motion_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Motion))
+		return true;
+	return plan_tree_walker(node, rf_motion_walker, context, false);
+}
+
+/*
+ * The rows of a plan node as the segment that runs it sees them. A plan's
+ * row estimates are a segment's share, and so are GPORCA's -- except in a
+ * slice it runs on one segment, as it does a join of replicated tables,
+ * where a replicated table read right there counts once per segment of the
+ * cluster: the number of segments times what the one segment reads. The
+ * gates below take rows for a segment's, so that estimate is divided back.
+ * A subtree with a Motion in it gathers what other segments read and is
+ * estimated right.
+ */
+static double
+rf_plan_rows(RuntimeFilterPlanContext *cx, Plan *plan)
+{
+	double		rows = plan->plan_rows;
+	int			nseg = getgpsegmentCount();
+	PlanSlice  *slice;
+
+	if (!cx->orcaRows || nseg <= 1 || cx->glob->slices == NULL ||
+		cx->sliceIndex < 0 || cx->sliceIndex >= cx->glob->numSlices)
+		return rows;
+	slice = &cx->glob->slices[cx->sliceIndex];
+	if (slice->gangType != GANGTYPE_SINGLETON_READER &&
+		!((slice->gangType == GANGTYPE_PRIMARY_READER ||
+		   slice->gangType == GANGTYPE_PRIMARY_WRITER) &&
+		  slice->numsegments == 1))
+		return rows;
+	if (rf_motion_walker((Node *) plan, cx))
+		return rows;
+	return rows / nseg;
+}
+
 static void
 rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 {
@@ -537,9 +580,11 @@ rf_consider_hashjoin(RuntimeFilterPlanContext *cx, HashJoin *hj)
 		return;
 	}
 
-	probeRows = outer->plan_rows;
-	buildRows = inner->plan_rows;
-	joinSel = probeRows > 0 ? hj->join.plan.plan_rows / probeRows : 1.0;
+	probeRows = rf_plan_rows(cx, outer);
+	buildRows = rf_plan_rows(cx, inner);
+	hj->rf_probe_rows = probeRows;
+	joinSel = outer->plan_rows > 0 ?
+		hj->join.plan.plan_rows / outer->plan_rows : 1.0;
 	joinSel = Max(0.0, Min(1.0, joinSel));
 
 	/*
@@ -727,8 +772,18 @@ rf_plan_walker(Node *node, void *context)
 	 * The plan is in its final form, with one range table for it and its
 	 * subplans, so a SubqueryScan's or a TableFunctionScan's plan is entered
 	 * like any other node's; SubPlans are walked by
-	 * runtimefilter_decide_plan(), once each.
+	 * runtimefilter_decide_plan(), once each. Below a Motion the nodes run
+	 * in the slice the Motion sends from (rf_plan_rows() asks).
 	 */
+	if (IsA(node, Motion))
+	{
+		int			saved = cx->sliceIndex;
+
+		cx->sliceIndex = ((Motion *) node)->motionID;
+		(void) plan_tree_walker(node, rf_plan_walker, context, false);
+		cx->sliceIndex = saved;
+		return false;
+	}
 	(void) plan_tree_walker(node, rf_plan_walker, context, false);
 
 	if (IsA(node, HashJoin))
@@ -743,16 +798,18 @@ rf_plan_walker(Node *node, void *context)
  * plans come so; the Postgres planner's are so after set_plan_references()),
  * and the hash keys refer to the children's target lists (OUTER_VAR,
  * INNER_VAR). 'paramExecTypes' is the list a new Param's type is appended
- * to.
+ * to. The slice table (glob->slices) is built; 'orcaRows' says the row
+ * estimates are GPORCA's (rf_plan_rows()).
  */
 void
 runtimefilter_decide_plan(PlannerGlobal *glob, Plan *plan, List *subplans,
 						  List *rtable, List **paramExecTypes,
-						  bool hasRowSecurity)
+						  bool hasRowSecurity, bool orcaRows)
 {
 	RuntimeFilterPlanContext cx;
 	PlannerInfo *root;
 	ListCell   *lc;
+	int			i;
 
 	if (!whpg_enable_runtime_filter)
 		return;
@@ -776,8 +833,20 @@ runtimefilter_decide_plan(PlannerGlobal *glob, Plan *plan, List *subplans,
 	cx.glob = glob;
 	cx.rtable = rtable;
 	cx.paramExecTypes = paramExecTypes;
+	cx.orcaRows = orcaRows;
 
+	/*
+	 * The plan's top node runs in slice 0; a subplan's where it is called
+	 * (subplan_sliceIds, one entry per subplan, -1 where none is known).
+	 */
+	cx.sliceIndex = 0;
 	(void) rf_plan_walker((Node *) plan, &cx);
+	i = 0;
 	foreach(lc, subplans)
+	{
+		cx.sliceIndex = (glob->subplan_sliceIds != NULL) ?
+			glob->subplan_sliceIds[i] : -1;
 		(void) rf_plan_walker((Node *) lfirst(lc), &cx);
+		i++;
+	}
 }

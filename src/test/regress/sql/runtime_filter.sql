@@ -365,6 +365,15 @@ SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim_mk_k d ON f.amt = d.amt AND f.k 
 SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim_mk_k d ON f.amt = d.amt AND f.k = d.k;
 SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_aoco f JOIN rf_dim_mk_k d ON f.amt = d.amt AND f.k = d.k$$) AS two_keys_nulls;
 
+-- The filter's allocation failing, as an out-of-memory error would: the
+-- error is the statement's, the session goes on, the next run is right.
+SELECT public.gp_inject_fault('runtime_filter_create', 'error', dbid)
+FROM gp_segment_configuration WHERE role = 'p' AND content >= 0;
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+SELECT public.gp_inject_fault('runtime_filter_create', 'reset', dbid)
+FROM gp_segment_configuration WHERE role = 'p' AND content >= 0;
+SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
+
 -- Why a join got no filter: EXPLAIN says, when asked. The last two are joins
 -- on two keys: one where neither key alone would drop enough rows (rf_dim's
 -- k and name cover 5000 of the fact's 6000), one whose probe has no
@@ -445,6 +454,18 @@ EXPLAIN (COSTS OFF)
 SELECT count(*) FROM rf_fact_heap f JOIN rf_dim_mk_k d ON f.amt = d.amt AND f.k = d.k;
 SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_heap f JOIN rf_dim_mk_k d ON f.amt = d.amt AND f.k = d.k$$) AS two_keys_nulls;
 SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k AND f.tag = d.name$$) AS two_keys_neither_selective;
+
+-- Two replicated tables: GPORCA joins them on one segment, and in that
+-- slice its row estimates count a replicated table once per segment of the
+-- cluster. The gates read the rows the one segment sees: a build side of
+-- 50000 ids fits a 64 kB filter, which three times as many would not.
+SET whpg_runtime_filter_max_size = '64kB';
+SET whpg_runtime_filter_explain = on;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_rep f JOIN rf_fact_rep g ON f.id = g.id WHERE g.amt < 250;
+RESET whpg_runtime_filter_explain;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_rep f JOIN rf_fact_rep g ON f.id = g.id WHERE g.amt < 250$$) AS replicated_build;
+RESET whpg_runtime_filter_max_size;
 
 -- A partitioned AOCO fact: the filter leads the dynamic scan's Staged Scan
 -- in every partition.

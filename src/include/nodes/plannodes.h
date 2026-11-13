@@ -1226,6 +1226,14 @@ typedef struct HashJoin
 	 * (planrtfilter.c), built from that key's own hash value (nodeHash.c).
 	 */
 	int			rf_keyidx;
+
+	/*
+	 * WHPG: the probe rows the pass judged the join by, a segment's share
+	 * (rf_plan_rows() in planrtfilter.c: GPORCA's estimate for a slice run on
+	 * one segment is divided back by the segment count); 0 when the pass did
+	 * not get that far. For EXPLAIN and the executor's own decisions.
+	 */
+	double		rf_probe_rows;
 } HashJoin;
 
 #define SHARE_ID_NOT_SHARED (-1)

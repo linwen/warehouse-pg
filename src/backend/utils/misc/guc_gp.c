@@ -4093,7 +4093,9 @@ struct config_int ConfigureNamesInt_gp[] =
 		{"whpg_runtime_filter_max_size", PGC_USERSET, QUERY_TUNING_OTHER,
 			gettext_noop("Maximum size of one runtime filter."),
 			gettext_noop("A hash join whose inner side would need a larger filter to stay "
-						 "useful gets none; a filter that turns out too dense is dropped."),
+						 "useful gets none; a filter that turns out too dense is dropped. "
+						 "The filter is memory of its own, up to this much per filtered join "
+						 "and segment process on top of the join's share of statement_mem."),
 			GUC_UNIT_KB | GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
 		},
 		&whpg_runtime_filter_max_size,

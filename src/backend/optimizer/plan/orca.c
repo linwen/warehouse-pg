@@ -241,11 +241,12 @@ optimize_query(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	 * slice (planrtfilter.c). Where one is added to an AOCO scan the Staged
 	 * Scan is decided again with it, hence after the pass above. ORCA's plan
 	 * is in its final form, as the Postgres planner's is after
-	 * set_plan_references(), where that path runs the same pass.
+	 * set_plan_references(), where that path runs the same pass. The row
+	 * estimates are ORCA's, which the pass reads with that in mind.
 	 */
 	runtimefilter_decide_plan(glob, result->planTree, result->subplans,
 							  result->rtable, &result->paramExecTypes,
-							  parse->hasRowSecurity);
+							  parse->hasRowSecurity, true);
 
 	/*
 	 * To save on memory, and on the network bandwidth when the plan is
