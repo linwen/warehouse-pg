@@ -42,7 +42,12 @@ extern RuntimeFilterBuilder *runtimefilter_create(double est_nkeys,
 												  MemoryContext cxt);
 extern void runtimefilter_insert(RuntimeFilterBuilder *builder,
 								 uint32 hashvalue);
+extern bool runtimefilter_overfull(const RuntimeFilterBuilder *builder);
+extern uint64 runtimefilter_builder_rows(const RuntimeFilterBuilder *builder);
+extern void runtimefilter_restart(RuntimeFilterBuilder *builder, double nkeys);
 extern struct varlena *runtimefilter_finish(RuntimeFilterBuilder *builder);
+extern struct varlena *runtimefilter_fold(struct varlena *filter);
+extern double runtimefilter_estimated_keys(const struct varlena *filter);
 extern bool runtimefilter_merge(struct varlena *into,
 								const struct varlena *other);
 extern struct varlena *runtimefilter_check(struct varlena *v);

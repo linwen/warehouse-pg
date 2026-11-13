@@ -239,8 +239,65 @@ ExecHashJoinPublishRuntimeFilter(HashJoinState *node, HashState *hashNode)
 
 	if (hashNode->rf_builder != NULL)
 	{
+		HashJoinTable hashtable = node->hj_HashTable;
+		HashJoin   *hj = (HashJoin *) node->js.ps.plan;
+
+		/*
+		 * The filter was sized from the estimate of the inner rows. Now the
+		 * rows are in: a filter they have filled past the point of use is
+		 * built again from the table, at the size that many rows call for,
+		 * when every inner tuple is still in memory (one batch) and that
+		 * size is within the limit -- a pass over the table, far cheaper
+		 * than the probes it saves -- and otherwise dropped by
+		 * runtimefilter_finish(). One they left nearly empty is folded down
+		 * to the size its keys need, so that the probes stay in cache.
+		 */
+		if (runtimefilter_overfull(hashNode->rf_builder) &&
+			hashtable != NULL && hashtable->nbatch == 1)
+		{
+			double		rows = (double) runtimefilter_builder_rows(hashNode->rf_builder);
+
+			if (runtimefilter_fits(rows))
+			{
+				runtimefilter_restart(hashNode->rf_builder, rows);
+				ExecHashRebuildRuntimeFilter(hashNode, hashtable);
+#ifdef FAULT_INJECTOR
+				SIMPLE_FAULT_INJECTOR("runtime_filter_rebuilt");
+#endif
+			}
+		}
 		node->hj_rfFilter = runtimefilter_finish(hashNode->rf_builder);
 		hashNode->rf_builder = NULL;
+
+		if (node->hj_rfFilter != NULL)
+		{
+			uint32		blocks = ((RuntimeFilter *) node->hj_rfFilter)->log2_blocks;
+
+			node->hj_rfFilter = runtimefilter_fold(node->hj_rfFilter);
+#ifdef FAULT_INJECTOR
+			if (((RuntimeFilter *) node->hj_rfFilter)->log2_blocks != blocks)
+				SIMPLE_FAULT_INJECTOR("runtime_filter_folded");
+#endif
+
+			/*
+			 * Worth handing to the scan? A filter holding about as many keys
+			 * as the probe has rows -- a segment's, as the planner pass
+			 * estimated them -- lets nearly every probe row through, and the
+			 * probes would be paid for nothing until the switch-off gave it
+			 * up; such a filter is not published at all. The estimate the
+			 * pass planned by said otherwise, so the rows did not come as
+			 * foreseen (stale statistics, a generic plan).
+			 */
+			if (hj->rf_probe_rows > 0 &&
+				runtimefilter_estimated_keys(node->hj_rfFilter) >= hj->rf_probe_rows)
+			{
+				pfree(node->hj_rfFilter);
+				node->hj_rfFilter = NULL;
+#ifdef FAULT_INJECTOR
+				SIMPLE_FAULT_INJECTOR("runtime_filter_withheld");
+#endif
+			}
+		}
 	}
 
 #ifdef FAULT_INJECTOR

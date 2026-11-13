@@ -183,6 +183,69 @@ ExecHashRuntimeFilterInsert(HashState *node, HashJoinTable hashtable,
 	MemoryContextSwitchTo(oldContext);
 }
 
+/* one tuple of the table, for ExecHashRebuildRuntimeFilter() */
+static void
+ExecHashRuntimeFilterReinsert(HashState *node, HashJoinTable hashtable,
+							  ExprContext *econtext, TupleTableSlot *slot,
+							  HashJoinTuple hashTuple)
+{
+	if (list_length(node->hashkeys) == 1)
+	{
+		runtimefilter_insert(node->rf_builder, hashTuple->hashvalue);
+		return;
+	}
+	ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple), slot, false);
+	econtext->ecxt_outertuple = slot;
+	ExecHashRuntimeFilterInsert(node, hashtable, econtext, hashTuple->hashvalue);
+}
+
+/*
+ * WHPG: feed the probe scan's runtime filter again, from the tuples the
+ * table holds, for a filter the estimate had left too small and the join is
+ * building again at the size the rows call for
+ * (ExecHashJoinPublishRuntimeFilter()). Every inner tuple is in the table
+ * when the join has a single batch, which the caller has checked: in the
+ * dense-allocated chunks, as ExecHashIncreaseNumBuckets() walks them, and
+ * in the skew buckets. A single key's hash value is the tuple's own; of
+ * several, the chosen key is evaluated again from the stored tuple.
+ */
+void
+ExecHashRebuildRuntimeFilter(HashState *node, HashJoinTable hashtable)
+{
+	ExprContext *econtext = node->ps.ps_ExprContext;
+	TupleTableSlot *slot = node->ps.ps_ResultTupleSlot;
+	TupleTableSlot *saved = econtext->ecxt_outertuple;
+	HashMemoryChunk chunk;
+
+	Assert(node->rf_builder != NULL);
+	Assert(hashtable->nbatch == 1);
+
+	for (chunk = hashtable->chunks; chunk != NULL; chunk = chunk->next.unshared)
+	{
+		size_t		idx = 0;
+
+		while (idx < chunk->used)
+		{
+			HashJoinTuple hashTuple = (HashJoinTuple) (HASH_CHUNK_DATA(chunk) + idx);
+
+			ExecHashRuntimeFilterReinsert(node, hashtable, econtext, slot, hashTuple);
+			idx += MAXALIGN(HJTUPLE_OVERHEAD +
+							HJTUPLE_MINTUPLE(hashTuple)->t_len);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	for (int i = 0; i < hashtable->nSkewBuckets; i++)
+	{
+		HashSkewBucket *bucket = hashtable->skewBucket[hashtable->skewBucketNums[i]];
+		HashJoinTuple hashTuple;
+
+		for (hashTuple = bucket->tuples; hashTuple != NULL;
+			 hashTuple = hashTuple->next.unshared)
+			ExecHashRuntimeFilterReinsert(node, hashtable, econtext, slot, hashTuple);
+	}
+	econtext->ecxt_outertuple = saved;
+}
+
 /* ----------------------------------------------------------------
  *		MultiExecPrivateHash
  *

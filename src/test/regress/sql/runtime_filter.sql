@@ -162,6 +162,25 @@ EXPLAIN (COSTS OFF)
 SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
 RESET whpg_enable_runtime_filter;
 
+-- rf_fault_hits(fault, q): how many times the segments hit a fault point of
+-- the executor's while q ran with the filter on.
+CREATE FUNCTION rf_fault_hits(fault text, q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+	hits bigint;
+BEGIN
+	SET LOCAL whpg_enable_runtime_filter = on;
+	PERFORM public.gp_inject_fault_infinite(fault, 'skip', dbid)
+	   FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	EXECUTE q;
+	SELECT sum(substring(public.gp_inject_fault(fault, 'status', dbid)
+						 from 'num times hit:''(\d+)''')::bigint)
+	  INTO hits
+	  FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	PERFORM public.gp_inject_fault(fault, 'reset', dbid)
+	   FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	RETURN hits;
+END $$;
+
 -- Statistics far off on the build side: planned on 10 rows, the filter gets
 -- 200000 keys at run time, far too many for the 64 kB allowed, and is
 -- dropped; the join still answers right.
@@ -171,9 +190,45 @@ ANALYZE rf_stale;
 INSERT INTO rf_stale SELECT i FROM generate_series(11, 200000) i;
 SET whpg_runtime_filter_max_size = 64;
 SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k$$) AS planned_on_stale_stats;
+SELECT rf_fault_hits('runtime_filter_published', $$SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k$$) AS dropped_none_published;
 SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k;
 SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k$$);
 RESET whpg_runtime_filter_max_size;
+
+-- Statistics far off, within the limit: planned on 10 rows, the filter gets
+-- 20010 keys, too many for the 8 kB it was sized at, and is built again
+-- from the hash table at the 64 kB they call for, once per segment; the
+-- probe's 66000 rows a segment are far more than those keys, so it is
+-- published.
+CREATE TABLE rf_stale_small(k int) DISTRIBUTED BY (k);
+INSERT INTO rf_stale_small SELECT i FROM generate_series(1, 10) i;
+ANALYZE rf_stale_small;
+INSERT INTO rf_stale_small SELECT i FROM generate_series(11, 20010) i;
+SELECT rf_fault_hits('runtime_filter_rebuilt', $$SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale_small s ON f.k = s.k$$) AS rebuilt_one_per_segment;
+SELECT rf_fault_hits('runtime_filter_published', $$SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale_small s ON f.k = s.k$$) AS published_one_per_segment;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_stale_small s ON f.k = s.k$$) AS rebuilt;
+
+-- The same build against a small probe: 20010 keys against the dimension's
+-- 1700 rows a segment would let every probe row through, so the filter,
+-- rebuilt or not, is not published.
+SELECT rf_fault_hits('runtime_filter_withheld', $$SELECT count(*) FROM rf_dim d JOIN rf_stale_small s ON d.k = s.k$$) AS withheld_one_per_segment;
+SELECT rf_fault_hits('runtime_filter_published', $$SELECT count(*) FROM rf_dim d JOIN rf_stale_small s ON d.k = s.k$$) AS withheld_none_published;
+SELECT rf_same($$SELECT count(*)::text FROM rf_dim d JOIN rf_stale_small s ON d.k = s.k$$) AS withheld;
+
+-- Statistics far above the rows: analyzed at 200000 keys, a hundred are
+-- left, and the 128 kB filter sized for the 33000 a segment the planner
+-- expects is folded down to the 8 kB the twenty keys a segment need, once
+-- per segment. (The predicate is on another column, so it does not carry
+-- over to the fact through the join; both sides are distributed on the
+-- key, so neither moves.)
+CREATE TABLE rf_shrunk(k int, grp int) DISTRIBUTED BY (k);
+INSERT INTO rf_shrunk SELECT i, i % 2 FROM generate_series(1, 200000) i;
+ANALYZE rf_shrunk;
+DELETE FROM rf_shrunk WHERE k > 100;
+SET whpg_runtime_filter_max_selectivity = 1.0;
+SELECT rf_fault_hits('runtime_filter_folded', $$SELECT count(*) FROM rf_fact_aoco f JOIN rf_shrunk s ON f.id = s.k WHERE s.grp = 0$$) AS folded_one_per_segment;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_shrunk s ON f.id = s.k WHERE s.grp = 0$$) AS folded;
+RESET whpg_runtime_filter_max_selectivity;
 
 -- Rescans. A hash join on the inner side of a nested loop runs again for
 -- every outer row; it keeps its hash table across those runs when its own

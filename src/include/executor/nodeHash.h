@@ -42,6 +42,8 @@ extern void ExecParallelHashTableSetCurrentBatch(HashJoinTable hashtable,
 extern bool ExecHashTableInsert(HashState *hashState, HashJoinTable hashtable,
 								TupleTableSlot *slot,
 								uint32 hashvalue);
+extern void ExecHashRebuildRuntimeFilter(HashState *node,
+										 HashJoinTable hashtable);
 extern void ExecParallelHashTableInsert(HashJoinTable hashtable,
 										TupleTableSlot *slot,
 										uint32 hashvalue);

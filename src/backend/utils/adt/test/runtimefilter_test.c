@@ -1,7 +1,9 @@
 /*
  * Unit test of the runtime filter's Bloom filter (runtimefilter.c): sizing,
  * insert/contains, the drop of an overfull filter, merge, the Param guard,
- * the switch-off tally and the inline integer hash.
+ * the switch-off tally, the inline integer hash, the key estimate read off
+ * the fill, the fold of an oversized filter and the restart of an overfull
+ * one.
  *
  * The filter cannot be called from SQL, so its limits are tested here; what
  * a query sees of them is in src/test/regress/sql/runtime_filter.sql.
@@ -448,6 +450,108 @@ test__hash_int__matches_hash_functions(void **state)
 	}
 }
 
+/* the keys a finished filter holds, read off its fill, within a tenth */
+static void
+test__estimated_keys__reads_the_fill(void **state)
+{
+	static const uint32 ns[] = {100, 1000, 10000, 100000};
+
+	reset_gucs();
+	for (int t = 0; t < lengthof(ns); t++)
+	{
+		RuntimeFilter *f = (RuntimeFilter *) runtimefilter_finish(build(ns[t], 0, ns[t]));
+		double		est = runtimefilter_estimated_keys((struct varlena *) f);
+
+		printf("estimate: %u keys read as %.0f\n", ns[t], est);
+		assert_true(est > ns[t] * 0.9 && est < ns[t] * 1.1);
+		pfree(f);
+	}
+
+	/* rows over few keys are read as the keys, not the rows */
+	{
+		RuntimeFilterBuilder *b = runtimefilter_create(1000, TopMemoryContext);
+		RuntimeFilter *f;
+
+		for (uint32 i = 0; i < 100000; i++)
+			runtimefilter_insert(b, hv(i % 100));
+		f = (RuntimeFilter *) runtimefilter_finish(b);
+		assert_true(runtimefilter_estimated_keys((struct varlena *) f) < 120);
+		pfree(f);
+	}
+}
+
+/*
+ * A filter sized for far more keys than it holds folds down to the size its
+ * keys need and keeps every one of them; one sized right is left alone.
+ */
+static void
+test__fold__shrinks_to_the_keys(void **state)
+{
+	RuntimeFilter *f;
+	RuntimeFilter *g;
+
+	reset_gucs();
+
+	/* a thousand keys in a filter for a million: 8 kB is all they need */
+	f = (RuntimeFilter *) runtimefilter_finish(build(1e6, 0, 1000));
+	assert_int_equal(f->log2_blocks, 16);
+	g = (RuntimeFilter *) runtimefilter_fold((struct varlena *) f);
+	assert_int_equal(g->log2_blocks, 8);
+	assert_int_equal(VARSIZE(g), RF_SIZE(8));
+	assert_true(runtimefilter_check((struct varlena *) g) == (struct varlena *) g);
+	for (uint32 i = 0; i < 1000; i++)
+		assert_true(runtimefilter_contains(g, hv(i)));
+	printf("folded: fill %.4f, %u false positives in 1000000\n",
+		   fill_of(g), false_positives(g, 1000000));
+	assert_true(false_positives(g, 1000000) < 100);
+	pfree(g);
+
+	/* 20000 keys in the 4 MB cap: to the 64 kB they need */
+	f = (RuntimeFilter *) runtimefilter_finish(build(1e9, 0, 20000));
+	assert_int_equal(f->log2_blocks, 17);
+	g = (RuntimeFilter *) runtimefilter_fold((struct varlena *) f);
+	assert_int_equal(g->log2_blocks, 11);
+	for (uint32 i = 0; i < 20000; i++)
+		assert_true(runtimefilter_contains(g, hv(i)));
+	assert_true(false_positives(g, 1000000) < 20000);
+	pfree(g);
+
+	/* sized for its keys: as it is */
+	f = (RuntimeFilter *) runtimefilter_finish(build(100000, 0, 100000));
+	assert_true(runtimefilter_fold((struct varlena *) f) == (struct varlena *) f);
+	assert_int_equal(f->log2_blocks, 13);
+	pfree(f);
+}
+
+/* an overfull builder started over at its row count comes out right */
+static void
+test__restart__resizes_for_the_rows(void **state)
+{
+	RuntimeFilterBuilder *b;
+	RuntimeFilter *f;
+
+	reset_gucs();
+	b = build(10, 0, 20000);		/* sized for ten, fed twenty thousand */
+	assert_true(runtimefilter_overfull(b));
+	assert_true(runtimefilter_builder_rows(b) == 20000);
+
+	runtimefilter_restart(b, (double) runtimefilter_builder_rows(b));
+	assert_true(runtimefilter_builder_rows(b) == 0);
+	assert_int_equal(b->filter->log2_blocks, 11);
+	assert_true(fill_of(b->filter) == 0.0);
+	for (uint32 i = 0; i < 20000; i++)
+		runtimefilter_insert(b, hv(i));
+	assert_false(runtimefilter_overfull(b));
+
+	f = (RuntimeFilter *) runtimefilter_finish(b);
+	assert_true(f != NULL);
+	assert_int_equal(f->nkeys, 20000);
+	for (uint32 i = 0; i < 20000; i++)
+		assert_true(runtimefilter_contains(f, hv(i)));
+	assert_true(false_positives(f, 1000000) < 20000);
+	pfree(f);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -465,7 +569,10 @@ main(int argc, char *argv[])
 		unit_test(test__merge__refuses_unlike_filters),
 		unit_test(test__check__rejects_what_is_not_a_filter),
 		unit_test(test__probe_count__switches_off_useless_filter),
-		unit_test(test__hash_int__matches_hash_functions)
+		unit_test(test__hash_int__matches_hash_functions),
+		unit_test(test__estimated_keys__reads_the_fill),
+		unit_test(test__fold__shrinks_to_the_keys),
+		unit_test(test__restart__resizes_for_the_rows)
 	};
 
 	MemoryContextInit();

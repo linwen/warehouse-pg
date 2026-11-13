@@ -161,14 +161,25 @@ function, block from the top half, bits from the bottom. It is sized at 16
 bits per expected key (about 1% false positives; the rate cannot fall below
 the number of keys over 2^32, since the filter is built from 32-bit hash
 values: 0.01% at 500,000 keys in a segment's filter, 0.1% near 5 million),
-never below 8 kB and never above `whpg_runtime_filter_max_size`. Should it
-come out too full -- more
-than 80% of its bits set once the table is built, about 17% false positives
-and climbing fast beyond -- the filter is dropped rather than probed for
-nothing; fullness is judged on the bits set, not on the tuples inserted, so an
-inner side of many rows over few keys keeps its filter however low the row
-estimate it was sized from. A false positive costs the hash table probe the
-join would have made anyway.
+never below 8 kB and never above `whpg_runtime_filter_max_size`. The rows
+that arrive then decide what becomes of it. Should it come out too full --
+more than 80% of its bits set once the table is built, about 17% false
+positives and climbing fast beyond -- it is built again from the hash
+table at the size that many rows call for, when every inner tuple is still
+in memory (a single batch) and that size is within the limit: one pass over
+the table, far cheaper than the probes it saves; otherwise it is dropped
+rather than probed for nothing. Fullness is judged on the bits set, not on
+the tuples inserted, so an inner side of many rows over few keys keeps its
+filter however low the row estimate it was sized from. Should it come out
+nearly empty -- the estimate far above the rows -- it is folded down to the
+size its keys need, each halving ORing the upper half of the blocks into
+the lower (a key's block is its hash masked to the block count, so every
+key stays in), so that the probes stay in cache. And a filter holding
+about as many keys as the probe has rows (a segment's, as the pass
+estimated them) is not published at all: it would let nearly every row
+through, and the probes would be paid for nothing until the switch-off.
+A false positive costs the hash table probe the join would have made
+anyway.
 
 ## What is guaranteed
 

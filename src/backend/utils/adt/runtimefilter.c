@@ -25,12 +25,16 @@
  * words, one bit set in each word, so that a probe touches a single cache
  * line. It is sized from the planner's estimate of the inner rows at about
  * 16 bits per key (roughly 1% false positives) and capped by
- * whpg_runtime_filter_max_size; should the estimate have been far too low,
- * so that fewer than RF_MIN_BITS_PER_KEY bits per key remain, the finished
- * filter is dropped (the Param stays NULL) rather than let a dense filter
- * cost probes for nothing. A false positive only costs the hash table probe
- * the join would have made anyway; a NULL key is rejected, since a strict
- * hash operator never matches it.
+ * whpg_runtime_filter_max_size. The rows that arrive decide what becomes of
+ * it (nodeHashjoin.c): a filter the estimate left too small -- more than
+ * RF_MAX_FILL of its bits set -- is built again from the hash table at the
+ * size the rows call for, when the table is all in memory and that size is
+ * within the limit, and dropped otherwise (the Param stays NULL) rather than
+ * let a dense filter cost probes for nothing; one the estimate left too
+ * large is folded down to the size its keys need (runtimefilter_fold()). A
+ * false positive only costs the hash table probe the join would have made
+ * anyway; a NULL key is rejected, since a strict hash operator never
+ * matches it.
  *
  * Portions Copyright (c) 2026, WarehousePG contributors.
  *
@@ -40,6 +44,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#include <math.h>
 
 #include "fmgr.h"
 #include "nodes/execnodes.h"
@@ -104,6 +110,49 @@ runtimefilter_fits(double nkeys)
 }
 
 /*
+ * The block count, as its log2, of a filter for nkeys keys: RF_BITS_PER_KEY
+ * bits per key, a power of two of blocks, never below RF_MIN_LOG2_BLOCKS and
+ * never above whpg_runtime_filter_max_size.
+ */
+static int
+rf_log2_for(double nkeys)
+{
+	int			log2 = RF_MIN_LOG2_BLOCKS;
+	double		want_bits = Max(nkeys, 1.0) * RF_BITS_PER_KEY;
+	Size		max_bits = rf_max_bits();
+
+	while (log2 < RF_MAX_LOG2_BLOCKS &&
+		   ((Size) 1 << log2) * RF_BLOCK_BITS < want_bits &&
+		   ((Size) 1 << (log2 + 1)) * RF_BLOCK_BITS <= max_bits &&
+		   RF_SIZE(log2 + 1) <= MaxAllocSize)
+		log2++;
+	return log2;
+}
+
+/* an empty filter of 2^log2 blocks in cxt */
+static RuntimeFilter *
+rf_alloc(int log2, MemoryContext cxt)
+{
+	Size		size = RF_SIZE(log2);
+	RuntimeFilter *f = (RuntimeFilter *) MemoryContextAllocZero(cxt, size);
+
+	SET_VARSIZE(f, size);
+	f->magic = RF_MAGIC;
+	f->log2_blocks = log2;
+	return f;
+}
+
+/* the share of the filter's bits that are set */
+static double
+rf_fill(const RuntimeFilter *f)
+{
+	Size		nbits = ((Size) 1 << f->log2_blocks) * RF_BLOCK_BITS;
+
+	return (double) pg_popcount((const char *) f->blocks, nbits / 8) /
+		(double) nbits;
+}
+
+/*
  * Start a filter sized for est_nkeys keys, allocated in cxt (the finished
  * filter stays there; the join frees it when it rebuilds or ends).
  */
@@ -111,28 +160,40 @@ RuntimeFilterBuilder *
 runtimefilter_create(double est_nkeys, MemoryContext cxt)
 {
 	RuntimeFilterBuilder *b;
-	RuntimeFilter *f;
-	int			log2 = RF_MIN_LOG2_BLOCKS;
-	double		want_bits = Max(est_nkeys, 1.0) * RF_BITS_PER_KEY;
-	Size		max_bits = rf_max_bits();
-	Size		size;
-
-	while (log2 < RF_MAX_LOG2_BLOCKS &&
-		   ((Size) 1 << log2) * RF_BLOCK_BITS < want_bits &&
-		   ((Size) 1 << (log2 + 1)) * RF_BLOCK_BITS <= max_bits &&
-		   RF_SIZE(log2 + 1) <= MaxAllocSize)
-		log2++;
-
-	size = RF_SIZE(log2);
-	f = (RuntimeFilter *) MemoryContextAllocZero(cxt, size);
-	SET_VARSIZE(f, size);
-	f->magic = RF_MAGIC;
-	f->log2_blocks = log2;
 
 	b = (RuntimeFilterBuilder *) MemoryContextAlloc(cxt, sizeof(RuntimeFilterBuilder));
-	b->filter = f;
+	b->filter = rf_alloc(rf_log2_for(est_nkeys), cxt);
 	b->nkeys = 0;
 	return b;
+}
+
+/* Would runtimefilter_finish() drop this filter as too full? */
+bool
+runtimefilter_overfull(const RuntimeFilterBuilder *b)
+{
+	return rf_fill(b->filter) > RF_MAX_FILL;
+}
+
+/* the rows inserted so far */
+uint64
+runtimefilter_builder_rows(const RuntimeFilterBuilder *b)
+{
+	return b->nkeys;
+}
+
+/*
+ * Start the builder over with an empty filter sized for nkeys keys, in the
+ * memory context of the one it had: for a filter the estimate left too
+ * small, to be fed again from the hash table (nodeHash.c).
+ */
+void
+runtimefilter_restart(RuntimeFilterBuilder *b, double nkeys)
+{
+	MemoryContext cxt = GetMemoryChunkContext(b->filter);
+
+	pfree(b->filter);
+	b->filter = rf_alloc(rf_log2_for(nkeys), cxt);
+	b->nkeys = 0;
 }
 
 void
@@ -157,10 +218,8 @@ struct varlena *
 runtimefilter_finish(RuntimeFilterBuilder *b)
 {
 	RuntimeFilter *f = b->filter;
-	Size		nbits = ((Size) 1 << f->log2_blocks) * RF_BLOCK_BITS;
-	uint64		set = pg_popcount((const char *) f->blocks, nbits / 8);
 
-	if ((double) set > RF_MAX_FILL * (double) nbits)
+	if (rf_fill(f) > RF_MAX_FILL)
 	{
 		pfree(f);
 		f = NULL;
@@ -168,6 +227,59 @@ runtimefilter_finish(RuntimeFilterBuilder *b)
 	else
 		f->nkeys = (uint32) Min(b->nkeys, PG_UINT32_MAX);
 	pfree(b);
+	return (struct varlena *) f;
+}
+
+/*
+ * About how many distinct keys a finished filter holds, read off its fill:
+ * a key sets one bit in each word of one block, so n keys over nbits bits
+ * set about nbits * (1 - exp(-8 n / nbits)) of them. Rows over a key already
+ * in set no new bits, so this counts keys where the builder counted rows; a
+ * filter with every bit set reads as holding as many keys as it has bits.
+ */
+double
+runtimefilter_estimated_keys(const struct varlena *v)
+{
+	const RuntimeFilter *f = (const RuntimeFilter *) v;
+	Size		nbits = ((Size) 1 << f->log2_blocks) * RF_BLOCK_BITS;
+	double		fill = rf_fill(f);
+
+	if (fill >= 1.0)
+		return (double) nbits;
+	if (fill <= 0.0)
+		return 0.0;
+	return -log(1.0 - fill) * (double) nbits / RF_BLOCK_WORDS;
+}
+
+/*
+ * Fold a finished filter the estimate left far too large -- a few keys in
+ * megabytes, every probe a cache miss -- down to the size its keys call for
+ * (RF_BITS_PER_KEY per key, as it would have been sized had the estimate
+ * been right). Each halving ORs the upper half of the blocks into the
+ * lower: a key's block is the top half of its hash masked to the block
+ * count, so in the halved filter it is the old block modulo the new count,
+ * and every key stays in. The filter is shrunk in its own memory context
+ * and the new pointer returned; a filter already at the size of its keys is
+ * returned as it is.
+ */
+struct varlena *
+runtimefilter_fold(struct varlena *v)
+{
+	RuntimeFilter *f = (RuntimeFilter *) v;
+	int			target = rf_log2_for(runtimefilter_estimated_keys(v));
+
+	if (target >= f->log2_blocks)
+		return v;
+	while (f->log2_blocks > target)
+	{
+		Size		half = ((Size) 1 << (f->log2_blocks - 1)) * RF_BLOCK_WORDS;
+
+		for (Size i = 0; i < half; i++)
+			f->blocks[i] |= f->blocks[half + i];
+		f->log2_blocks--;
+	}
+	f = (RuntimeFilter *) repalloc(f, RF_SIZE(f->log2_blocks));
+	SET_VARSIZE(f, RF_SIZE(f->log2_blocks));
 	return (struct varlena *) f;
 }
 
