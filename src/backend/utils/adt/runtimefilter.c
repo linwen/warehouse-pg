@@ -53,6 +53,7 @@
 #include "parser/parse_coerce.h"
 #include "port/pg_bitutils.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/regproc.h"
@@ -175,6 +176,105 @@ runtimefilter_overfull(const RuntimeFilterBuilder *b)
 	return rf_fill(b->filter) > RF_MAX_FILL;
 }
 
+/* Throw the builder and its filter away: another form was chosen. */
+void
+runtimefilter_discard(RuntimeFilterBuilder *b)
+{
+	pfree(b->filter);
+	pfree(b);
+}
+
+/*
+ * The width of the keys a hash support function hashes as integers, for a
+ * filter that may hold the keys' range or a bitmap over it: 2, 4 or 8 for
+ * hashint2, hashint4 (int4 and date) and hashint8 (int8, timestamp,
+ * timestamptz), 0 for any other function.
+ */
+int
+runtimefilter_int_width(Oid hashproc)
+{
+	switch (hashproc)
+	{
+		case F_HASHINT2:
+			return 2;
+		case F_HASHINT4:
+			return 4;
+		case F_HASHINT8:
+			return 8;
+	}
+	return 0;
+}
+
+/*
+ * The bitmap over [lo, hi]: the number of blocks it takes, as a log2, or -1
+ * when the range is wider than whpg_runtime_filter_max_size allows.
+ */
+static int
+rf_bitmap_log2(int64 lo, int64 hi)
+{
+	double		span = (double) hi - (double) lo + 1.0;
+	int			log2 = 0;
+
+	if (span <= 0 || span > (double) rf_max_bits())
+		return -1;
+	while (((double) ((Size) 1 << log2)) * RF_BLOCK_BITS < span)
+		log2++;
+	return log2;
+}
+
+/*
+ * Is a bitmap over [lo, hi] worth having over a Bloom filter for nkeys
+ * keys? When it is no larger: exact, and a probe is a subtraction and a bit
+ * test instead of a hash.
+ */
+bool
+runtimefilter_bitmap_worth(int64 lo, int64 hi, double nkeys)
+{
+	int			log2 = rf_bitmap_log2(lo, hi);
+
+	return log2 >= 0 && log2 <= rf_log2_for(nkeys);
+}
+
+struct varlena *
+runtimefilter_bitmap_create(int64 lo, int64 hi, MemoryContext cxt)
+{
+	int			log2 = rf_bitmap_log2(lo, hi);
+	RuntimeFilter *f;
+
+	if (log2 < 0)
+		return NULL;
+	f = rf_alloc(log2, cxt);
+	f->flags = RF_FLAG_BITMAP;
+	f->lo = lo;
+	f->hi = hi;
+	return (struct varlena *) f;
+}
+
+void
+runtimefilter_bitmap_set(struct varlena *v, int64 key)
+{
+	RuntimeFilter *f = (RuntimeFilter *) v;
+	uint64		bit;
+
+	Assert(f->flags & RF_FLAG_BITMAP);
+	Assert(key >= f->lo && key <= f->hi);
+	bit = (uint64) (key - f->lo);
+	f->blocks[bit >> 5] |= 1U << (bit & 31);
+	f->nkeys = (uint32) Min((uint64) f->nkeys + 1, PG_UINT32_MAX);
+}
+
+/* Tag a Bloom filter over integer keys with their range: a probe outside it is rejected before hashing. */
+void
+runtimefilter_set_range(struct varlena *v, int64 lo, int64 hi)
+{
+	RuntimeFilter *f = (RuntimeFilter *) v;
+
+	Assert(!(f->flags & RF_FLAG_BITMAP));
+	f->flags |= RF_FLAG_INTRANGE;
+	f->lo = lo;
+	f->hi = hi;
+}
+
 /* the rows inserted so far */
 uint64
 runtimefilter_builder_rows(const RuntimeFilterBuilder *b)
@@ -245,6 +345,8 @@ runtimefilter_estimated_keys(const struct varlena *v)
 	Size		nbits = ((Size) 1 << f->log2_blocks) * RF_BLOCK_BITS;
 	double		fill = rf_fill(f);
 
+	if (f->flags & RF_FLAG_BITMAP)	/* exact: one bit per key */
+		return fill * (double) nbits;
 	if (fill >= 1.0)
 		return (double) nbits;
 	if (fill <= 0.0)
@@ -260,15 +362,18 @@ runtimefilter_estimated_keys(const struct varlena *v)
  * lower: a key's block is the top half of its hash masked to the block
  * count, so in the halved filter it is the old block modulo the new count,
  * and every key stays in. The filter is shrunk in its own memory context
- * and the new pointer returned; a filter already at the size of its keys is
- * returned as it is.
+ * and the new pointer returned; a filter already at the size of its keys, or
+ * a bitmap (sized by its range), is returned as it is.
  */
 struct varlena *
 runtimefilter_fold(struct varlena *v)
 {
 	RuntimeFilter *f = (RuntimeFilter *) v;
-	int			target = rf_log2_for(runtimefilter_estimated_keys(v));
+	int			target;
 
+	if (f->flags & RF_FLAG_BITMAP)
+		return v;
+	target = rf_log2_for(runtimefilter_estimated_keys(v));
 	if (target >= f->log2_blocks)
 		return v;
 	while (f->log2_blocks > target)
@@ -301,6 +406,17 @@ runtimefilter_merge(struct varlena *into, const struct varlena *other)
 	if (a->magic != RF_MAGIC || b->magic != RF_MAGIC ||
 		a->log2_blocks != b->log2_blocks || a->flags != b->flags)
 		return false;
+	/* a bitmap is over its range; a Bloom filter's range widens */
+	if (a->flags & RF_FLAG_BITMAP)
+	{
+		if (a->lo != b->lo || a->hi != b->hi)
+			return false;
+	}
+	else if (a->flags & RF_FLAG_INTRANGE)
+	{
+		a->lo = Min(a->lo, b->lo);
+		a->hi = Max(a->hi, b->hi);
+	}
 
 	nwords = ((Size) 1 << a->log2_blocks) * RF_BLOCK_WORDS;
 	for (Size i = 0; i < nwords; i++)
@@ -445,8 +561,22 @@ runtimefilter_probe_init(const RuntimeFilterExpr *rfexpr)
 								  OidIsValid(keytype) ?
 								  format_type_be(keytype) : "unknown"));
 	else
+	{
 		fmgr_info(hashproc, &probe->hashfn);
+		probe->intlen = runtimefilter_int_width(hashproc);
+	}
 	return probe;
+}
+
+/* the integer value of a key hashed as an integer of 'len' bytes */
+static inline int64
+rf_int_key(Datum value, int len)
+{
+	if (len == 8)
+		return DatumGetInt64(value);
+	if (len == 4)
+		return (int64) DatumGetInt32(value);
+	return (int64) DatumGetInt16(value);
 }
 
 /*
@@ -509,6 +639,27 @@ runtimefilter_probe(RuntimeFilterProbeState *probe, ExprContext *econtext)
 	/* a filter that has shown itself useless lets the rows through */
 	if (f->disabled)
 		return true;
+
+	/*
+	 * Over an integer-like key the filter may hold the keys' range, or be a
+	 * bitmap over it; a key hashed as an integer is tested as one. (A
+	 * non-strict operator's NULL key, hashed as 0 below, is not an integer
+	 * key: the join does not give such a key a filter over integers.)
+	 */
+	if ((f->flags & (RF_FLAG_INTRANGE | RF_FLAG_BITMAP)) && !probe->keynull)
+	{
+		if (probe->intlen == 0)
+		{
+			rf_probe_give_up(probe, "the filter is over integer keys, the probe key is not one");
+			return true;
+		}
+		result = runtimefilter_test_int(f, rf_int_key(probe->keyvalue, probe->intlen),
+										probe->intlen);
+		runtimefilter_probe_count(f, result);
+		return result;
+	}
+	if (f->flags & RF_FLAG_BITMAP)
+		return true;			/* a NULL key under a non-strict operator: not in a bitmap's domain */
 
 	/* a non-strict operator's NULL key hashes as 0, as in the join */
 	if (probe->keynull)

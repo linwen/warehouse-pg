@@ -552,6 +552,89 @@ test__restart__resizes_for_the_rows(void **state)
 	pfree(f);
 }
 
+/*
+ * The exact form over integer keys: a bitmap over their range, chosen when
+ * no larger than the Bloom filter would be, exact on members and
+ * non-members alike; a Bloom filter tagged with the range rejects a key
+ * outside it without a hash.
+ */
+static void
+test__bitmap__exact_over_the_range(void **state)
+{
+	RuntimeFilter *f;
+
+	reset_gucs();
+
+	/* 100 keys spanning 5000 values: a 5000-bit bitmap beats the 8 kB Bloom filter */
+	assert_true(runtimefilter_bitmap_worth(3, 4953, 100));
+	/* 100 keys spanning a million: not when the bitmap would be the larger */
+	assert_false(runtimefilter_bitmap_worth(0, 1000000, 100));
+	/* a range beyond the size limit: never */
+	assert_false(runtimefilter_bitmap_worth(0, INT64CONST(1) << 40, 1e9));
+	assert_true(runtimefilter_bitmap_create(0, INT64CONST(1) << 40, TopMemoryContext) == NULL);
+
+	f = (RuntimeFilter *) runtimefilter_bitmap_create(3, 4953, TopMemoryContext);
+	assert_true(f != NULL);
+	assert_int_equal(f->flags, RF_FLAG_BITMAP);
+	assert_int_equal(f->log2_blocks, 5);	/* 32 blocks, 8192 bits >= 4951 */
+	assert_true(runtimefilter_check((struct varlena *) f) == (struct varlena *) f);
+	for (int64 k = 3; k <= 4953; k += 50)
+		runtimefilter_bitmap_set((struct varlena *) f, k);
+	assert_int_equal(f->nkeys, 100);
+	assert_true(runtimefilter_estimated_keys((struct varlena *) f) == 100.0);
+	for (int64 k = -10; k <= 5000; k++)
+	{
+		bool		member = (k >= 3 && k <= 4953 && (k - 3) % 50 == 0);
+
+		assert_true(runtimefilter_test_int(f, k, 4) == member);
+		assert_true(runtimefilter_test_int(f, k, 8) == member);
+	}
+	/* a bitmap is sized by its range: not folded */
+	assert_true(runtimefilter_fold((struct varlena *) f) == (struct varlena *) f);
+	pfree(f);
+
+	/* a Bloom filter tagged with the range: outside it, no, without a hash */
+	f = (RuntimeFilter *) runtimefilter_finish(build(1000, 0, 1000));
+	runtimefilter_set_range((struct varlena *) f, 100, 200);
+	assert_int_equal(f->flags, RF_FLAG_INTRANGE);
+	assert_false(runtimefilter_test_int(f, 99, 4));
+	assert_false(runtimefilter_test_int(f, 201, 8));
+	/* inside it, the Bloom filter answers (hv(i) is the int4 key i's hash) */
+	assert_true(runtimefilter_test_int(f, 150, 4));
+	pfree(f);
+}
+
+/* bitmaps merge only over the same range; a tagged Bloom filter's range widens */
+static void
+test__merge__ranges(void **state)
+{
+	RuntimeFilter *a;
+	RuntimeFilter *b;
+
+	reset_gucs();
+	a = (RuntimeFilter *) runtimefilter_bitmap_create(0, 1000, TopMemoryContext);
+	b = (RuntimeFilter *) runtimefilter_bitmap_create(0, 1000, TopMemoryContext);
+	runtimefilter_bitmap_set((struct varlena *) a, 10);
+	runtimefilter_bitmap_set((struct varlena *) b, 20);
+	assert_true(runtimefilter_merge((struct varlena *) a, (struct varlena *) b));
+	assert_true(runtimefilter_test_int(a, 10, 4) && runtimefilter_test_int(a, 20, 4));
+	assert_false(runtimefilter_test_int(a, 30, 4));
+	assert_int_equal(a->nkeys, 2);
+	b->lo = 1;
+	assert_false(runtimefilter_merge((struct varlena *) a, (struct varlena *) b));
+	pfree(a);
+	pfree(b);
+
+	a = (RuntimeFilter *) runtimefilter_finish(build(20000, 0, 10000));
+	b = (RuntimeFilter *) runtimefilter_finish(build(20000, 500000, 10000));
+	runtimefilter_set_range((struct varlena *) a, 0, 9999);
+	runtimefilter_set_range((struct varlena *) b, 500000, 509999);
+	assert_true(runtimefilter_merge((struct varlena *) a, (struct varlena *) b));
+	assert_true(a->lo == 0 && a->hi == 509999);
+	pfree(a);
+	pfree(b);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -572,7 +655,9 @@ main(int argc, char *argv[])
 		unit_test(test__hash_int__matches_hash_functions),
 		unit_test(test__estimated_keys__reads_the_fill),
 		unit_test(test__fold__shrinks_to_the_keys),
-		unit_test(test__restart__resizes_for_the_rows)
+		unit_test(test__restart__resizes_for_the_rows),
+		unit_test(test__bitmap__exact_over_the_range),
+		unit_test(test__merge__ranges)
 	};
 
 	MemoryContextInit();

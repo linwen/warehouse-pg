@@ -41,6 +41,25 @@ BEGIN
 	RETURN a IS NOT NULL AND a = b;
 END $$;
 
+-- rf_fault_hits(fault, q): how many times the segments hit a fault point of
+-- the executor's while q ran with the filter on.
+CREATE FUNCTION rf_fault_hits(fault text, q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+	hits bigint;
+BEGIN
+	SET LOCAL whpg_enable_runtime_filter = on;
+	PERFORM public.gp_inject_fault_infinite(fault, 'skip', dbid)
+	   FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	EXECUTE q;
+	SELECT sum(substring(public.gp_inject_fault(fault, 'status', dbid)
+						 from 'num times hit:''(\d+)''')::bigint)
+	  INTO hits
+	  FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	PERFORM public.gp_inject_fault(fault, 'reset', dbid)
+	   FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
+	RETURN hits;
+END $$;
+
 -- The dimension: 5000 keys, a flag that keeps 2% of them, a bigint copy of
 -- the key and a text one for cross-type and text joins.
 CREATE TABLE rf_dim(k int, flag int, kb bigint, name text) DISTRIBUTED BY (k);
@@ -111,6 +130,37 @@ SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f WHERE EXISTS (SELECT 
 SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f WHERE NOT EXISTS (SELECT 1 FROM rf_dim d WHERE d.k = f.k AND d.flag = 3)$$) AS anti_join;
 SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f WHERE f.k NOT IN (SELECT d.k FROM rf_dim d WHERE d.flag = 3)$$) AS not_in;
 
+-- The filter's form. Over an integer-like key the join knows the keys'
+-- range once the table is built; a bitmap over the range, exact and
+-- hash-free, takes the Bloom filter's place when it is no larger: the
+-- hundred keys of one flag span 5000 values, a bitmap of 5000 bits. Keys
+-- spread over billions keep the Bloom filter, tagged with their range so
+-- that a key outside it is rejected without a hash. A date key is an
+-- integer key.
+SELECT rf_fault_hits('runtime_filter_bitmap', $$SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3$$) AS bitmap_one_per_segment;
+CREATE TABLE rf_dim_wide(k bigint, flag int) DISTRIBUTED BY (k);
+INSERT INTO rf_dim_wide SELECT i::bigint * 1000000, i % 50 FROM generate_series(1, 5000) i;
+CREATE TABLE rf_fact_wide(id int, k bigint) USING ao_column DISTRIBUTED BY (id);
+INSERT INTO rf_fact_wide SELECT id, k::bigint * 1000000 FROM rf_fact_heap;
+CREATE TABLE rf_fact_wide_k(LIKE rf_fact_wide) USING ao_column DISTRIBUTED BY (k);
+INSERT INTO rf_fact_wide_k SELECT * FROM rf_fact_wide;
+ANALYZE rf_dim_wide;
+ANALYZE rf_fact_wide;
+ANALYZE rf_fact_wide_k;
+SELECT rf_fault_hits('runtime_filter_bitmap', $$SELECT count(*) FROM rf_fact_wide f JOIN rf_dim_wide d ON f.k = d.k WHERE d.flag = 3$$) AS wide_keys_no_bitmap;
+SELECT rf_fault_hits('runtime_filter_published', $$SELECT count(*) FROM rf_fact_wide f JOIN rf_dim_wide d ON f.k = d.k WHERE d.flag = 3$$) AS wide_keys_bloom_published;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_wide f JOIN rf_dim_wide d ON f.k = d.k WHERE d.flag = 3$$) AS wide_keys;
+CREATE TABLE rf_dim_date(d date, flag int) DISTRIBUTED BY (d);
+INSERT INTO rf_dim_date SELECT date '2020-01-01' + i, i % 50 FROM generate_series(0, 729) i;
+CREATE TABLE rf_fact_date(id int, d date) USING ao_column DISTRIBUTED BY (id);
+INSERT INTO rf_fact_date SELECT id, date '2020-01-01' + (k % 730) FROM rf_fact_heap WHERE k IS NOT NULL;
+ANALYZE rf_dim_date;
+ANALYZE rf_fact_date;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rf_fact_date f JOIN rf_dim_date d ON f.d = d.d WHERE d.flag = 3;
+SELECT rf_fault_hits('runtime_filter_bitmap', $$SELECT count(*) FROM rf_fact_date f JOIN rf_dim_date d ON f.d = d.d WHERE d.flag = 3$$) AS date_bitmap_one_per_segment;
+SELECT rf_same($$SELECT md5(string_agg(f.id::text, ',' ORDER BY f.id)) FROM rf_fact_date f JOIN rf_dim_date d ON f.d = d.d WHERE d.flag = 3$$) AS date_key;
+
 -- Cross-type (int4 = int8) and text keys: the probe hashes with its own
 -- type's function, which the hash opfamily keeps consistent with the inner's.
 EXPLAIN (COSTS OFF)
@@ -173,58 +223,41 @@ EXPLAIN (COSTS OFF)
 SELECT count(*) FROM rf_fact_aoco f JOIN rf_dim d ON f.k = d.k WHERE d.flag = 3;
 RESET whpg_enable_runtime_filter;
 
--- rf_fault_hits(fault, q): how many times the segments hit a fault point of
--- the executor's while q ran with the filter on.
-CREATE FUNCTION rf_fault_hits(fault text, q text) RETURNS bigint LANGUAGE plpgsql AS $$
-DECLARE
-	hits bigint;
-BEGIN
-	SET LOCAL whpg_enable_runtime_filter = on;
-	PERFORM public.gp_inject_fault_infinite(fault, 'skip', dbid)
-	   FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
-	EXECUTE q;
-	SELECT sum(substring(public.gp_inject_fault(fault, 'status', dbid)
-						 from 'num times hit:''(\d+)''')::bigint)
-	  INTO hits
-	  FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
-	PERFORM public.gp_inject_fault(fault, 'reset', dbid)
-	   FROM gp_segment_configuration WHERE content > -1 AND role = 'p';
-	RETURN hits;
-END $$;
-
--- Statistics far off on the build side: planned on 10 rows, the filter gets
+-- Statistics far off on the build side. The keys are spread a million
+-- apart, so these are Bloom filters (dense keys would get a bitmap, sized
+-- by their range and never too full). Planned on 10 rows, the filter gets
 -- 200000 keys at run time, far too many for the 64 kB allowed, and is
 -- dropped; the join still answers right.
-CREATE TABLE rf_stale(k int) DISTRIBUTED BY (k);
-INSERT INTO rf_stale SELECT i FROM generate_series(1, 10) i;
+CREATE TABLE rf_stale(k bigint) DISTRIBUTED BY (k);
+INSERT INTO rf_stale SELECT i::bigint * 1000000 FROM generate_series(1, 10) i;
 ANALYZE rf_stale;
-INSERT INTO rf_stale SELECT i FROM generate_series(11, 200000) i;
+INSERT INTO rf_stale SELECT i::bigint * 1000000 FROM generate_series(11, 200000) i;
 SET whpg_runtime_filter_max_size = 64;
-SELECT rf_planned($$SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k$$) AS planned_on_stale_stats;
-SELECT rf_fault_hits('runtime_filter_published', $$SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k$$) AS dropped_none_published;
-SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k;
-SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_stale s ON f.k = s.k$$);
+SELECT rf_planned($$SELECT count(*) FROM rf_fact_wide f JOIN rf_stale s ON f.k = s.k$$) AS planned_on_stale_stats;
+SELECT rf_fault_hits('runtime_filter_published', $$SELECT count(*) FROM rf_fact_wide f JOIN rf_stale s ON f.k = s.k$$) AS dropped_none_published;
+SELECT count(*) FROM rf_fact_wide f JOIN rf_stale s ON f.k = s.k;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_wide f JOIN rf_stale s ON f.k = s.k$$);
 RESET whpg_runtime_filter_max_size;
 
 -- Statistics far off, within the limit: planned on 10 rows, the filter gets
--- 20010 keys, too many for the 8 kB it was sized at, and is built again
--- from the hash table at the 64 kB they call for, once per segment; the
--- probe's 66000 rows a segment are far more than those keys, so it is
--- published.
-CREATE TABLE rf_stale_small(k int) DISTRIBUTED BY (k);
-INSERT INTO rf_stale_small SELECT i FROM generate_series(1, 10) i;
+-- 20010 keys (the small side is broadcast), too many for the 8 kB it was
+-- sized at, and is built again from the hash table at the 64 kB they call
+-- for, once per segment; the probe's 66000 rows a segment are far more than
+-- those keys, so it is published.
+CREATE TABLE rf_stale_small(k bigint) DISTRIBUTED BY (k);
+INSERT INTO rf_stale_small SELECT i::bigint * 1000000 FROM generate_series(1, 10) i;
 ANALYZE rf_stale_small;
-INSERT INTO rf_stale_small SELECT i FROM generate_series(11, 20010) i;
-SELECT rf_fault_hits('runtime_filter_rebuilt', $$SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale_small s ON f.k = s.k$$) AS rebuilt_one_per_segment;
-SELECT rf_fault_hits('runtime_filter_published', $$SELECT count(*) FROM rf_fact_aoco f JOIN rf_stale_small s ON f.k = s.k$$) AS published_one_per_segment;
-SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_stale_small s ON f.k = s.k$$) AS rebuilt;
+INSERT INTO rf_stale_small SELECT i::bigint * 1000000 FROM generate_series(11, 20010) i;
+SELECT rf_fault_hits('runtime_filter_rebuilt', $$SELECT count(*) FROM rf_fact_wide f JOIN rf_stale_small s ON f.k = s.k$$) AS rebuilt_one_per_segment;
+SELECT rf_fault_hits('runtime_filter_published', $$SELECT count(*) FROM rf_fact_wide f JOIN rf_stale_small s ON f.k = s.k$$) AS published_one_per_segment;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_wide f JOIN rf_stale_small s ON f.k = s.k$$) AS rebuilt;
 
--- The same build against a small probe: 20010 keys against the dimension's
--- 1700 rows a segment would let every probe row through, so the filter,
--- rebuilt or not, is not published.
-SELECT rf_fault_hits('runtime_filter_withheld', $$SELECT count(*) FROM rf_dim d JOIN rf_stale_small s ON d.k = s.k$$) AS withheld_one_per_segment;
-SELECT rf_fault_hits('runtime_filter_published', $$SELECT count(*) FROM rf_dim d JOIN rf_stale_small s ON d.k = s.k$$) AS withheld_none_published;
-SELECT rf_same($$SELECT count(*)::text FROM rf_dim d JOIN rf_stale_small s ON d.k = s.k$$) AS withheld;
+-- The same build against a small probe, both distributed on the key: a
+-- segment's 6700 keys against the dimension's 1700 rows would let every
+-- probe row through, so the filter is not published.
+SELECT rf_fault_hits('runtime_filter_withheld', $$SELECT count(*) FROM rf_dim_wide d JOIN rf_stale_small s ON d.k = s.k$$) AS withheld_one_per_segment;
+SELECT rf_fault_hits('runtime_filter_published', $$SELECT count(*) FROM rf_dim_wide d JOIN rf_stale_small s ON d.k = s.k$$) AS withheld_none_published;
+SELECT rf_same($$SELECT count(*)::text FROM rf_dim_wide d JOIN rf_stale_small s ON d.k = s.k$$) AS withheld;
 
 -- Statistics far above the rows: analyzed at 200000 keys, a hundred are
 -- left, and the 128 kB filter sized for the 33000 a segment the planner
@@ -232,13 +265,13 @@ SELECT rf_same($$SELECT count(*)::text FROM rf_dim d JOIN rf_stale_small s ON d.
 -- per segment. (The predicate is on another column, so it does not carry
 -- over to the fact through the join; both sides are distributed on the
 -- key, so neither moves.)
-CREATE TABLE rf_shrunk(k int, grp int) DISTRIBUTED BY (k);
-INSERT INTO rf_shrunk SELECT i, i % 2 FROM generate_series(1, 200000) i;
+CREATE TABLE rf_shrunk(k bigint, grp int) DISTRIBUTED BY (k);
+INSERT INTO rf_shrunk SELECT i::bigint * 1000000, i % 2 FROM generate_series(1, 200000) i;
 ANALYZE rf_shrunk;
-DELETE FROM rf_shrunk WHERE k > 100;
+DELETE FROM rf_shrunk WHERE k > 100 * 1000000;
 SET whpg_runtime_filter_max_selectivity = 1.0;
-SELECT rf_fault_hits('runtime_filter_folded', $$SELECT count(*) FROM rf_fact_aoco f JOIN rf_shrunk s ON f.id = s.k WHERE s.grp = 0$$) AS folded_one_per_segment;
-SELECT rf_same($$SELECT count(*)::text FROM rf_fact_aoco f JOIN rf_shrunk s ON f.id = s.k WHERE s.grp = 0$$) AS folded;
+SELECT rf_fault_hits('runtime_filter_folded', $$SELECT count(*) FROM rf_fact_wide_k f JOIN rf_shrunk s ON f.k = s.k WHERE s.grp = 0$$) AS folded_one_per_segment;
+SELECT rf_same($$SELECT count(*)::text FROM rf_fact_wide_k f JOIN rf_shrunk s ON f.k = s.k WHERE s.grp = 0$$) AS folded;
 RESET whpg_runtime_filter_max_selectivity;
 
 -- Rescans. A hash join on the inner side of a nested loop runs again for

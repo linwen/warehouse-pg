@@ -191,6 +191,21 @@ through, and the probes would be paid for nothing until the switch-off.
 A false positive costs the hash table probe the join would have made
 anyway.
 
+**Integer keys get an exact filter when they can.** Over a key hashed as an
+integer (int2, int4, int8, date, timestamp, timestamptz) the join reads the
+keys' range off the table once it is built, and when a bitmap over the
+range is no larger than the Bloom filter for that many rows would be, the
+bitmap takes its place (`RF_FLAG_BITMAP`): one bit per value, no false
+positives, and a probe is a subtraction and a bit test instead of a hash.
+TPC-DS's surrogate keys are dense, so a dimension's hundred dates, or the
+thirty thousand customers of a state, are bitmaps of a few kilobytes;
+keys spread over billions keep the Bloom filter, tagged with their range
+(`RF_FLAG_INTRANGE`) so that a key outside it is rejected without a hash.
+The Staged Scan's fast path, which has the raw value in hand, tests the
+bitmap directly; the qual's probe reads the key as the integer its hash
+function would have hashed. Only a join whose table is all in memory (one
+batch) can read the range; a spilled join keeps the Bloom filter as built.
+
 ## What is guaranteed
 
 The join's answer is unchanged. The filter can only reject a probe row whose

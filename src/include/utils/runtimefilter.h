@@ -81,18 +81,28 @@ extern struct varlena *runtimefilter_check(struct varlena *v);
  * value is the hash table's own; it is spread to 64 bits, the top half picks
  * the block, the bottom half the bit in each word through eight odd
  * multipliers.
+ *
+ * Over an integer-like key (int2, int4, int8, date, timestamp, timestamptz:
+ * the types hashint2/4/8 hash) the join also knows the keys' range, and
+ * when the range is no wider than the Bloom filter would be, the filter is
+ * a plain bitmap over it instead (RF_FLAG_BITMAP): exact, one bit per
+ * value, no hash at all. A Bloom filter over such a key carries the range
+ * too (RF_FLAG_INTRANGE) and rejects a value outside it before hashing.
  */
-#define RF_MAGIC				0x32465257	/* "WRF2": format and version */
+#define RF_MAGIC				0x33465257	/* "WRF3": format and version */
 #define RF_BLOCK_WORDS			8
 #define RF_BLOCK_BITS			(RF_BLOCK_WORDS * 32)
+
+#define RF_FLAG_INTRANGE		0x1	/* lo/hi hold the integer keys' range */
+#define RF_FLAG_BITMAP			0x2	/* blocks is a bitmap over [lo, hi] */
 
 typedef struct RuntimeFilter
 {
 	int32		vl_len_;		/* varlena header (do not touch directly) */
 	uint32		magic;
-	uint32		log2_blocks;
+	uint32		log2_blocks;	/* blocks of RF_BLOCK_BITS, as a power of two */
 	uint32		nkeys;			/* keys inserted, saturating */
-	uint32		flags;			/* none defined yet; equal on both sides of a merge */
+	uint32		flags;			/* RF_FLAG_*; equal on both sides of a merge */
 
 	/*
 	 * The switch-off's tally (runtimefilter_probe_count() below), kept in
@@ -105,6 +115,10 @@ typedef struct RuntimeFilter
 	uint32		disabled;
 	uint64		seen;
 	uint64		passed;
+
+	/* the integer keys' range, when RF_FLAG_INTRANGE or RF_FLAG_BITMAP */
+	int64		lo;
+	int64		hi;
 
 	uint32		blocks[FLEXIBLE_ARRAY_MEMBER];	/* RF_BLOCK_WORDS per block */
 } RuntimeFilter;
@@ -170,6 +184,46 @@ runtimefilter_hash_int(int64 v, int len)
 }
 
 /*
+ * Does the integer-like key v pass the filter? Outside the keys' range, no,
+ * without a hash; a bitmap answers exactly from its bit; a Bloom filter is
+ * probed with the key's hash value, which is hashint2/4/8's for 'len' 2, 4
+ * or 8 (the caller has checked the operator hashes so).
+ */
+static inline bool
+runtimefilter_test_int(RuntimeFilter *f, int64 v, int len)
+{
+	if (f->flags & (RF_FLAG_INTRANGE | RF_FLAG_BITMAP))
+	{
+		if (v < f->lo || v > f->hi)
+			return false;
+		if (f->flags & RF_FLAG_BITMAP)
+		{
+			uint64		bit = (uint64) (v - f->lo);
+
+			return (f->blocks[bit >> 5] >> (bit & 31)) & 1;
+		}
+	}
+	return runtimefilter_contains(f, runtimefilter_hash_int(v, len));
+}
+
+/* The width (2, 4, 8) of the keys a hash support function hashes as integers, 0 for any other. */
+extern int	runtimefilter_int_width(Oid hashproc);
+
+/*
+ * The exact form over an integer-like key: a bitmap over the keys' range
+ * [lo, hi], built by the join once the table holds every inner row
+ * (nodeHashjoin.c) and worth it when no wider than the Bloom filter for
+ * nkeys keys would be. runtimefilter_bitmap_create() returns NULL for a
+ * range beyond whpg_runtime_filter_max_size.
+ */
+extern bool runtimefilter_bitmap_worth(int64 lo, int64 hi, double nkeys);
+extern struct varlena *runtimefilter_bitmap_create(int64 lo, int64 hi,
+												   MemoryContext cxt);
+extern void runtimefilter_bitmap_set(struct varlena *filter, int64 v);
+extern void runtimefilter_set_range(struct varlena *filter, int64 lo, int64 hi);
+extern void runtimefilter_discard(RuntimeFilterBuilder *builder);
+
+/*
  * The probe watches the filter's usefulness: every RF_ADAPT_WINDOW rows,
  * once at least RF_ADAPT_MIN_ROWS have been tested, a filter that let more
  * than whpg_runtime_filter_disable_ratio of them through is switched off for
@@ -227,6 +281,7 @@ typedef struct RuntimeFilterProbeState
 	bool		keynull;
 	FmgrInfo	hashfn;			/* the hash operator's left-hand hash function */
 	Oid			collation;
+	int			intlen;			/* 2, 4, 8 when hashfn hashes integers so, else 0 */
 	bool		opstrict;		/* does the hash operator reject NULL? */
 	bool		unusable;		/* a check failed: every row passes */
 } RuntimeFilterProbeState;

@@ -1757,13 +1757,23 @@ stagedscan_rf_match(StagedScanState *gi, int64 v, int len)
 		if (rf->cur == NULL || rf->cur->disabled)
 			continue;
 		if (rf->inlineHash)
-			hv = runtimefilter_hash_int(v, len);
+		{
+			/* an integer key: the range, the bitmap or the Bloom filter */
+			ok = runtimefilter_test_int(rf->cur, v, len);
+		}
+		else if (rf->cur->flags & (RF_FLAG_INTRANGE | RF_FLAG_BITMAP))
+		{
+			/* a filter over integer keys for a column not hashed as one: let the row through */
+			continue;
+		}
 		else
+		{
 			hv = DatumGetUInt32(FunctionCall1Coll(&rf->hashfn, rf->collation,
 												  len == 8 ? Int64GetDatum(v) :
 												  len == 4 ? Int32GetDatum((int32) v) :
 												  Int16GetDatum((int16) v)));
-		ok = runtimefilter_contains(rf->cur, hv);
+			ok = runtimefilter_contains(rf->cur, hv);
+		}
 		runtimefilter_probe_count(rf->cur, ok);
 		if (!ok)
 			return false;

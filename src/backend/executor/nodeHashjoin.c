@@ -241,23 +241,59 @@ ExecHashJoinPublishRuntimeFilter(HashJoinState *node, HashState *hashNode)
 	{
 		HashJoinTable hashtable = node->hj_HashTable;
 		HashJoin   *hj = (HashJoin *) node->js.ps.plan;
+		bool		inMemory = (hashtable != NULL && hashtable->nbatch == 1);
+		double		rows = (double) runtimefilter_builder_rows(hashNode->rf_builder);
+		int			intlen = 0;
+		int64		lo = 0;
+		int64		hi = 0;
+		bool		haveRange = false;
 
 		/*
-		 * The filter was sized from the estimate of the inner rows. Now the
-		 * rows are in: a filter they have filled past the point of use is
-		 * built again from the table, at the size that many rows call for,
-		 * when every inner tuple is still in memory (one batch) and that
-		 * size is within the limit -- a pass over the table, far cheaper
-		 * than the probes it saves -- and otherwise dropped by
+		 * The filter was built from the estimate of the inner rows. Now the
+		 * rows are in, and when every inner tuple is still in memory (one
+		 * batch) the table itself can say what filter they call for; a pass
+		 * over it is far cheaper than the probes.
+		 *
+		 * Over an integer-like key the table gives the keys' range. When a
+		 * bitmap over the range is no larger than the Bloom filter for that
+		 * many rows, it takes the Bloom filter's place: exact, and a probe is
+		 * a subtraction and a bit test. Otherwise the Bloom filter stands,
+		 * tagged with the range, and rejects a key outside it before hashing.
+		 */
+		if (inMemory && hashtable->totalTuples > 0)
+		{
+			int			idx = (list_length(hashNode->hashkeys) == 1) ? 0 : hashNode->rf_keyidx;
+
+			intlen = runtimefilter_int_width(hashtable->inner_hashfunctions[idx].fn_oid);
+			if (intlen > 0)
+				haveRange = ExecHashRuntimeFilterKeyRange(hashNode, hashtable,
+														  intlen, &lo, &hi);
+		}
+		if (haveRange && runtimefilter_bitmap_worth(lo, hi, rows))
+		{
+			node->hj_rfFilter = runtimefilter_bitmap_create(lo, hi, estate->es_query_cxt);
+			if (node->hj_rfFilter != NULL)
+			{
+				ExecHashRuntimeFilterBitmap(hashNode, hashtable, intlen, node->hj_rfFilter);
+				runtimefilter_discard(hashNode->rf_builder);
+				hashNode->rf_builder = NULL;
+#ifdef FAULT_INJECTOR
+				SIMPLE_FAULT_INJECTOR("runtime_filter_bitmap");
+#endif
+			}
+		}
+
+		/*
+		 * The Bloom filter. One the rows have filled past the point of use
+		 * is built again from the table, at the size that many rows call
+		 * for, when that size is within the limit, and otherwise dropped by
 		 * runtimefilter_finish(). One they left nearly empty is folded down
 		 * to the size its keys need, so that the probes stay in cache.
 		 */
-		if (runtimefilter_overfull(hashNode->rf_builder) &&
-			hashtable != NULL && hashtable->nbatch == 1)
+		if (hashNode->rf_builder != NULL)
 		{
-			double		rows = (double) runtimefilter_builder_rows(hashNode->rf_builder);
-
-			if (runtimefilter_fits(rows))
+			if (inMemory && runtimefilter_overfull(hashNode->rf_builder) &&
+				runtimefilter_fits(rows))
 			{
 				runtimefilter_restart(hashNode->rf_builder, rows);
 				ExecHashRebuildRuntimeFilter(hashNode, hashtable);
@@ -265,9 +301,11 @@ ExecHashJoinPublishRuntimeFilter(HashJoinState *node, HashState *hashNode)
 				SIMPLE_FAULT_INJECTOR("runtime_filter_rebuilt");
 #endif
 			}
+			node->hj_rfFilter = runtimefilter_finish(hashNode->rf_builder);
+			hashNode->rf_builder = NULL;
+			if (node->hj_rfFilter != NULL && haveRange)
+				runtimefilter_set_range(node->hj_rfFilter, lo, hi);
 		}
-		node->hj_rfFilter = runtimefilter_finish(hashNode->rf_builder);
-		hashNode->rf_builder = NULL;
 
 		if (node->hj_rfFilter != NULL)
 		{
