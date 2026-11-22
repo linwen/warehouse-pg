@@ -108,6 +108,32 @@ SET SESSION AUTHORIZATION regress_pw_role;
 SELECT regress_parallel_worker_probe(1);
 ROLLBACK;
 
--- The probe function, regress_pw_loop() and regress_pw_tab are left in the
+-- The relation extension lock stands for one process adding a block to a
+-- relation at a time, so it conflicts between a leader and its worker,
+-- although the two share a lock group and, on a segment, a session whose
+-- processes do not block each other on any other lock.  An extension whose
+-- workers write the index they build depends on it: without the conflict
+-- two of them extend the index to the same block.  The probe's leader holds
+-- the lock; its worker must be refused when it asks without waiting, must
+-- wait when it asks again, and gets the lock once the leader lets go.
+--
+-- The worker's wait is reported under the leader's distributed transaction,
+-- as a wait of the transaction for itself.  The global deadlock detector
+-- cannot reduce such an edge and would cancel the transaction, so a segment
+-- must not report it: wait_rows is 0.  The INSERT gives the transaction its
+-- distributed transaction id.
+CREATE FUNCTION regress_parallel_extension_lock_probe(regclass)
+   RETURNS text
+   AS '@libdir@/regress@DLSUFFIX@'
+   LANGUAGE C STRICT;
+
+BEGIN;
+INSERT INTO regress_pw_tab SELECT generate_series(11, 20);
+SELECT regress_parallel_extension_lock_probe('regress_pw_tab');
+SELECT gp_segment_id, regress_parallel_extension_lock_probe('regress_pw_tab')
+FROM gp_dist_random('gp_id') ORDER BY 1;
+ROLLBACK;
+
+-- The probe functions, regress_pw_loop() and regress_pw_tab are left in the
 -- regression database on purpose, like the other regress.so functions, for
 -- the tools that run against it afterwards.

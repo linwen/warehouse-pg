@@ -1657,9 +1657,17 @@ LockCheckConflicts(LockMethod lockMethodTable,
 				/*
 				 * If processes in my session are holding the lock, mask
 				 * it out so that we won't be blocked by them.
+				 *
+				 * Not so for the relation extension lock: it stands for
+				 * one process adding a block at a time, whichever session
+				 * the process belongs to.  A parallel worker runs in its
+				 * leader's session and may extend the same relation, so
+				 * only what this process holds itself is masked out.
 				 */
 				if (otherProc->mppSessionId == mppSessionId &&
-					otherProclock->holdMask & LOCKBIT_ON(i))
+					otherProclock->holdMask & LOCKBIT_ON(i) &&
+					(LOCK_LOCKTAG(*lock) != LOCKTAG_RELATION_EXTEND ||
+					 otherProclock == proclock))
 					ourHolding++;
 
 				otherProclock =

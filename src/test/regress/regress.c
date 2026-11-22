@@ -21,12 +21,14 @@
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
+#include "access/relation.h"
 #include "access/transam.h"
 #include "access/tuptoaster.h"
 #include "access/xact.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbtm.h"
 #include "cdb/cdbutil.h"
 #include "cdb/cdbvars.h"
 #include "commands/sequence.h"
@@ -40,6 +42,9 @@
 #include "optimizer/plancat.h"
 #include "port/atomics.h"
 #include "storage/dsm.h"
+#include "storage/lmgr.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/shm_toc.h"
 #include "storage/spin.h"
 #include "utils/array.h"
@@ -1421,6 +1426,165 @@ regress_parallel_worker_main(dsm_segment *seg, shm_toc *toc)
 		ereport(ERROR,
 				(errcode(ERRCODE_RAISE_EXCEPTION),
 				 errmsg("parallel worker failed on request")));
+}
+
+/*
+ * Relation extension lock probe.
+ *
+ * regress_parallel_extension_lock_probe(rel) takes the extension lock of rel
+ * in whatever process runs it and launches one parallel worker that asks for
+ * the same lock, first without waiting and then waiting.  The lock stands
+ * for one process adding a block to the relation at a time, so the worker
+ * must be refused and must wait, although it belongs to its leader's lock
+ * group and, on a segment, to its leader's session.  While the worker waits,
+ * the probe counts the rows gp_dist_wait_status() has for it: the worker
+ * waits for a process of its own distributed transaction, which is nothing
+ * the global deadlock detector may act on, so there must be none.
+ */
+#define PARALLEL_KEY_REGRESS_EXTLOCK	UINT64CONST(0xA000000000000002)
+
+typedef struct RegressExtLockShared
+{
+	Oid			relid;
+	int			worker_pid;
+	bool		asked;			/* the request without waiting was made */
+	bool		granted;		/* and it was granted */
+	bool		acquired;		/* the waiting request has returned */
+} RegressExtLockShared;
+
+PGDLLEXPORT void regress_parallel_extension_lock_main(dsm_segment *seg, shm_toc *toc);
+
+PG_FUNCTION_INFO_V1(regress_parallel_extension_lock_probe);
+Datum
+regress_parallel_extension_lock_probe(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+	HeapTuple	proctup;
+	Datum		probin;
+	bool		isnull;
+	char	   *library;
+	ParallelContext *pcxt;
+	RegressExtLockShared *shared;
+	bool		waited = false;
+	int64		wait_rows = -1;
+	int			i;
+	StringInfoData buf;
+
+	/* Workers look their entry point up in the library this function lives in. */
+	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fcinfo->flinfo->fn_oid));
+	if (!HeapTupleIsValid(proctup))
+		elog(ERROR, "cache lookup failed for function %u", fcinfo->flinfo->fn_oid);
+	probin = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_probin, &isnull);
+	if (isnull)
+		elog(ERROR, "function %u has no library", fcinfo->flinfo->fn_oid);
+	library = TextDatumGetCString(probin);
+	ReleaseSysCache(proctup);
+
+	rel = relation_open(relid, AccessShareLock);
+
+	EnterParallelMode();
+	pcxt = CreateParallelContext(library, "regress_parallel_extension_lock_main", 1);
+	shm_toc_estimate_chunk(&pcxt->estimator, sizeof(RegressExtLockShared));
+	shm_toc_estimate_keys(&pcxt->estimator, 1);
+	InitializeParallelDSM(pcxt);
+
+	shared = (RegressExtLockShared *) shm_toc_allocate(pcxt->toc,
+													   sizeof(RegressExtLockShared));
+	memset(shared, 0, sizeof(RegressExtLockShared));
+	shared->relid = relid;
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_REGRESS_EXTLOCK, shared);
+
+	LockRelationForExtension(rel, ExclusiveLock);
+
+	LaunchParallelWorkers(pcxt);
+	if (pcxt->nworkers_launched != 1)
+	{
+		UnlockRelationForExtension(rel, ExclusiveLock);
+		elog(ERROR, "could not launch a parallel worker");
+	}
+
+	/*
+	 * Wait until the worker sleeps on the lock, or has got it although we
+	 * hold it.  Give up after a minute.
+	 */
+	for (i = 0; i < 6000 && !shared->acquired; i++)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		if (shared->asked)
+		{
+			PGPROC	   *proc = BackendPidGetProc(shared->worker_pid);
+
+			if (proc != NULL && proc->waitLock != NULL)
+			{
+				waited = true;
+				break;
+			}
+		}
+		pg_usleep(10000L);
+	}
+
+	/* A segment reports its own waits; that is the report the detector reads. */
+	if (waited && Gp_role == GP_ROLE_EXECUTE)
+	{
+		char		query[128];
+
+		snprintf(query, sizeof(query),
+				 "SELECT count(*) FROM gp_dist_wait_status() WHERE waiter_lpid = %d",
+				 shared->worker_pid);
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		if (SPI_execute(query, true, 1) != SPI_OK_SELECT || SPI_processed != 1)
+			elog(ERROR, "could not read gp_dist_wait_status()");
+		wait_rows = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+												 SPI_tuptable->tupdesc, 1, &isnull));
+		SPI_finish();
+	}
+
+	UnlockRelationForExtension(rel, ExclusiveLock);
+	WaitForParallelWorkersToFinish(pcxt);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "leader=%s content=%d dxid=%s refused=%c waited=%c wait_rows=",
+					 role_to_string(Gp_role), GpIdentity.segindex,
+					 getDistributedTransactionId() != InvalidDistributedTransactionId ? "valid" : "none",
+					 (shared->asked && !shared->granted) ? 't' : 'f',
+					 waited ? 't' : 'f');
+	if (wait_rows >= 0)
+		appendStringInfo(&buf, INT64_FORMAT, wait_rows);
+	else
+		appendStringInfoString(&buf, "n/a");
+	appendStringInfo(&buf, " acquired=%c", shared->acquired ? 't' : 'f');
+
+	DestroyParallelContext(pcxt);
+	ExitParallelMode();
+	relation_close(rel, AccessShareLock);
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+void
+regress_parallel_extension_lock_main(dsm_segment *seg, shm_toc *toc)
+{
+	RegressExtLockShared *shared;
+	Relation	rel;
+
+	shared = (RegressExtLockShared *) shm_toc_lookup(toc, PARALLEL_KEY_REGRESS_EXTLOCK,
+													 false);
+	rel = relation_open(shared->relid, AccessShareLock);
+
+	shared->worker_pid = MyProcPid;
+	shared->granted = ConditionalLockRelationForExtension(rel, ExclusiveLock);
+	if (shared->granted)
+		UnlockRelationForExtension(rel, ExclusiveLock);
+	shared->asked = true;
+
+	LockRelationForExtension(rel, ExclusiveLock);
+	shared->acquired = true;
+	UnlockRelationForExtension(rel, ExclusiveLock);
+
+	relation_close(rel, AccessShareLock);
 }
 
 /*

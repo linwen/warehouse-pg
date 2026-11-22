@@ -259,6 +259,19 @@ gp_dist_wait_status(PG_FUNCTION_ARGS)
 			w_dxid = w_lock->distribXid;
 			h_dxid = h_lock->distribXid;
 
+			/*
+			 * Processes of one distributed transaction can wait for each
+			 * other: the relation extension lock conflicts inside a session,
+			 * so a parallel worker may wait for its leader.  Such a wait is
+			 * an edge from the transaction to itself.  It says nothing about
+			 * a deadlock between transactions, and no reduction rule would
+			 * ever remove it, so leave it out.  Processes without a
+			 * distributed transaction are unrelated to each other and stay.
+			 */
+			if (w_dxid == h_dxid &&
+				w_dxid != InvalidDistributedTransactionId)
+				continue;
+
 			values[0] = Int32GetDatum(GpIdentity.segindex);
 			values[1] = DistributedTransactionIdGetDatum(w_dxid);
 			values[2] = DistributedTransactionIdGetDatum(h_dxid);
